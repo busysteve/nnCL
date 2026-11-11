@@ -17,7 +17,6 @@ class IndexTensor {
   IndexTensor& operator=(const IndexTensor&) = delete;
 
   void copy_from_host(const int64_t* src, int64_t n);
-  // Host copy. nn's CUDA build reads data() with cudaMemcpy; this is the same bytes.
   std::vector<int64_t> to_host() const;
   const int64_t* data() const { return data_; }
   const std::vector<int>& shape() const { return shape_; }
