@@ -266,22 +266,8 @@ std::string program_options(cl_device_id device, bool fp64) {
   return options;
 }
 
-bool take_device(cl_device_id candidate, cl_context& context, cl_device_id& device) {
-  cl_int err = CL_SUCCESS;
-  cl_context trial = clCreateContext(nullptr, 1, &candidate, nullptr, nullptr, &err);
-  if (err != CL_SUCCESS || !trial) return false;
-  if (!work_group_ok(candidate)) {
-    clReleaseContext(trial);
-    return false;
-  }
-  context = trial;
-  device = candidate;
-  return true;
-}
-
-void consider_devices(cl_platform_id platform, cl_device_type type, Vendor want, cl_context& context,
-                      cl_device_id& device) {
-  if (context) return;
+void append_usable(std::vector<cl_device_id>& out, cl_platform_id platform, cl_device_type type,
+                   Vendor want) {
   cl_uint ndev = 0;
   cl_int err = clGetDeviceIDs(platform, type, 0, nullptr, &ndev);
   if (err != CL_SUCCESS || ndev == 0) return;
@@ -290,12 +276,30 @@ void consider_devices(cl_platform_id platform, cl_device_type type, Vendor want,
   if (err != CL_SUCCESS) return;
   const std::string platform_vendor = cl_text_platform(platform, CL_PLATFORM_VENDOR);
   for (cl_device_id candidate : devices) {
-    if (context) return;
     const std::string vendor = cl_text_device(candidate, CL_DEVICE_VENDOR);
     const std::string name = cl_text_device(candidate, CL_DEVICE_NAME);
     if (!vendor_match(want, vendor, name, platform_vendor)) continue;
-    take_device(candidate, context, device);
+    if (!work_group_ok(candidate)) continue;
+    out.push_back(candidate);
   }
+}
+
+std::vector<cl_device_id> usable_devices() {
+  cl_uint nplat = 0;
+  cl_int err = clGetPlatformIDs(0, nullptr, &nplat);
+  if (err != CL_SUCCESS || nplat == 0) return {};
+  std::vector<cl_platform_id> platforms(nplat);
+  if (clGetPlatformIDs(nplat, platforms.data(), nullptr) != CL_SUCCESS) return {};
+  const Vendor want = compiled_vendor();
+  std::vector<cl_device_id> devices;
+  for (cl_platform_id platform : platforms) append_usable(devices, platform, CL_DEVICE_TYPE_GPU, want);
+  // Intel's ICD on a machine with no Intel GPU is the CPU runtime.
+  if (devices.empty() && want == Vendor::Intel) {
+    for (cl_platform_id platform : platforms) {
+      append_usable(devices, platform, CL_DEVICE_TYPE_CPU, want);
+    }
+  }
+  return devices;
 }
 
 std::string read_file(const char* path) {
@@ -308,28 +312,27 @@ std::string read_file(const char* path) {
 
 }  // namespace
 
+int opencl_device_count() { return static_cast<int>(usable_devices().size()); }
+
+std::string opencl_device_name(int index) {
+  const std::vector<cl_device_id> devices = usable_devices();
+  if (index < 0 || index >= static_cast<int>(devices.size())) throw Error("device");
+  return cl_text_device(devices[static_cast<size_t>(index)], CL_DEVICE_NAME);
+}
+
 void check_cl(cl_int status, const char* call) {
   if (status == CL_SUCCESS) return;
   throw Error(std::string(call) + ": " + cl_error_name(status));
 }
 
-void Context::Impl::open() {
-  cl_uint nplat = 0;
-  cl_int err = clGetPlatformIDs(0, nullptr, &nplat);
-  if (err != CL_SUCCESS || nplat == 0) throw Error("OpenCL device");
-  std::vector<cl_platform_id> platforms(nplat);
-  check_cl(clGetPlatformIDs(nplat, platforms.data(), nullptr), "clGetPlatformIDs");
-  const Vendor want = compiled_vendor();
-  for (cl_platform_id platform : platforms) {
-    consider_devices(platform, CL_DEVICE_TYPE_GPU, want, context, device);
-  }
-  // Intel's ICD on a machine with no Intel GPU is the CPU runtime.
-  if (!context && want == Vendor::Intel) {
-    for (cl_platform_id platform : platforms) {
-      consider_devices(platform, CL_DEVICE_TYPE_CPU, want, context, device);
-    }
-  }
-  if (!context) throw Error("OpenCL device");
+void Context::Impl::open(int index) {
+  const std::vector<cl_device_id> devices = usable_devices();
+  if (devices.empty()) throw Error("OpenCL device");
+  if (index < 0 || index >= static_cast<int>(devices.size())) throw Error("device");
+  device = devices[static_cast<size_t>(index)];
+  cl_int err = CL_SUCCESS;
+  context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
+  if (err != CL_SUCCESS || !context) throw Error("OpenCL device");
 
   cl_device_fp_config fp_config = 0;
   clGetDeviceInfo(device, CL_DEVICE_DOUBLE_FP_CONFIG, sizeof(fp_config), &fp_config, nullptr);

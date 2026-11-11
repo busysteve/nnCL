@@ -24,6 +24,8 @@ cmake --build build
 
 `auto` does not use a CPU device. A requested vendor that is not installed fails with `OpenCL device`.
 
+`Context()` uses device 0 from that list. `Context(int device)` uses that index. `device_count()` and `device_name(int)` report the same list: GPUs with a large enough work-group, or the Intel CPU devices when `intel` found no GPU. An index outside the list throws `device`.
+
 An Apple host includes `<OpenCL/cl.h>` and creates the queue with `clCreateCommandQueue`. Other hosts use the OpenCL 3.0 headers and `clCreateCommandQueueWithProperties`.
 
 Kernels are read at runtime from `src/kernels.cl` (the path compiled into the library). An `nn::Error` message looks like `call: CL_STATUS_NAME`.

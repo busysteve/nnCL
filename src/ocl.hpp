@@ -36,7 +36,7 @@ struct Context::Impl {
   size_t gemm_lx = 1;
   size_t gemm_ly = 1;
 
-  void open();
+  void open(int index);
   ~Impl();
 };
 
@@ -46,6 +46,8 @@ struct ContextAccess {
 };
 
 void check_cl(cl_int status, const char* call);
+int opencl_device_count();
+std::string opencl_device_name(int device);
 
 cl_mem alloc_mem(Context& ctx, size_t bytes);
 void free_mem(cl_mem mem) noexcept;

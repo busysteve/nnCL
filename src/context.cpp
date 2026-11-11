@@ -2,7 +2,13 @@
 
 namespace nn {
 
-Context::Context() : impl_(std::make_unique<Impl>()) { impl_->open(); }
+int device_count() { return opencl_device_count(); }
+
+std::string device_name(int device) { return opencl_device_name(device); }
+
+Context::Context() : impl_(std::make_unique<Impl>()) { impl_->open(0); }
+
+Context::Context(int device) : impl_(std::make_unique<Impl>()) { impl_->open(device); }
 
 Context::~Context() = default;
 
