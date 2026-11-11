@@ -26,6 +26,8 @@ cmake --build build
 
 `Context()` uses device 0 from that list. `Context(int device)` uses that index. `device_count()` and `device_name(int)` report the same list: GPUs with a large enough work-group, or the Intel CPU devices when `intel` found no GPU. An index outside the list throws `device`.
 
+`detect_devices()` returns that list. `select_device("auto")` and `Context("auto")` use the first entry. `select_device("1")` and `Context("1")` select that index by hand. This `auto` is not the `NNCL_OPENCL` vendor filter. A blank choice, a word other than `auto`, or an index past the list throws `device`.
+
 An Apple host includes `<OpenCL/cl.h>` and creates the queue with `clCreateCommandQueue`. Other hosts use the OpenCL 3.0 headers and `clCreateCommandQueueWithProperties`.
 
 Kernels are read at runtime from `src/kernels.cl` (the path compiled into the library). An `nn::Error` message looks like `call: CL_STATUS_NAME`.
