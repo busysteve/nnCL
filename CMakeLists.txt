@@ -8,6 +8,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenCL REQUIRED)
 
+# auto keeps the first usable GPU. The other values require that vendor's device.
+# intel uses an Intel GPU, or the Intel CPU device when no Intel GPU is listed.
+set(NNCL_OPENCL "auto" CACHE STRING "OpenCL vendor: auto, radeon, intel, apple, or nvidia")
+set_property(CACHE NNCL_OPENCL PROPERTY STRINGS auto radeon intel apple nvidia)
+string(TOLOWER "${NNCL_OPENCL}" NNCL_OPENCL_LOWER)
+if(NOT NNCL_OPENCL_LOWER MATCHES "^(auto|radeon|intel|apple|nvidia)$")
+  message(FATAL_ERROR "NNCL_OPENCL must be auto, radeon, intel, apple, or nvidia")
+endif()
+message(STATUS "nnCL OpenCL vendor: ${NNCL_OPENCL_LOWER}")
+
 add_library(nn STATIC
   src/context.cpp
   src/ocl.cpp
@@ -47,9 +57,19 @@ target_include_directories(nn
 
 target_link_libraries(nn PUBLIC OpenCL::OpenCL)
 
+if(APPLE)
+  set(NNCL_CL_TARGET 120)
+else()
+  set(NNCL_CL_TARGET 300)
+endif()
+
 target_compile_definitions(nn PRIVATE
-  CL_TARGET_OPENCL_VERSION=300
+  CL_TARGET_OPENCL_VERSION=${NNCL_CL_TARGET}
   NNCL_KERNELS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels.cl")
+if(NOT NNCL_OPENCL_LOWER STREQUAL "auto")
+  string(TOUPPER "${NNCL_OPENCL_LOWER}" NNCL_OPENCL_UPPER)
+  target_compile_definitions(nn PRIVATE NNCL_OPENCL_${NNCL_OPENCL_UPPER}=1)
+endif()
 
 set_target_properties(nn PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

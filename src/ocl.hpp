@@ -1,12 +1,22 @@
 #pragma once
 
+#if defined(__APPLE__)
+#ifndef CL_TARGET_OPENCL_VERSION
+#define CL_TARGET_OPENCL_VERSION 120
+#endif
+#else
 #ifndef CL_TARGET_OPENCL_VERSION
 #define CL_TARGET_OPENCL_VERSION 300
+#endif
 #endif
 
 #include "nn/context.hpp"
 
+#if defined(__APPLE__)
+#include <OpenCL/cl.h>
+#else
 #include <CL/cl.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>

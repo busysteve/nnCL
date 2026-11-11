@@ -2,8 +2,10 @@
 
 #include "nn/error.hpp"
 
+#include <cctype>
 #include <fstream>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace nn {
@@ -179,6 +181,123 @@ void enqueue_gemm(Context& ctx, const char* name, float* C, const float* A, cons
   call.nd(global, local, 3);
 }
 
+enum class Vendor { Auto, Radeon, Intel, Apple, Nvidia };
+
+Vendor compiled_vendor() {
+#if defined(NNCL_OPENCL_RADEON)
+  return Vendor::Radeon;
+#elif defined(NNCL_OPENCL_INTEL)
+  return Vendor::Intel;
+#elif defined(NNCL_OPENCL_APPLE)
+  return Vendor::Apple;
+#elif defined(NNCL_OPENCL_NVIDIA)
+  return Vendor::Nvidia;
+#else
+  return Vendor::Auto;
+#endif
+}
+
+std::string cl_text_device(cl_device_id device, cl_device_info query) {
+  size_t bytes = 0;
+  if (clGetDeviceInfo(device, query, 0, nullptr, &bytes) != CL_SUCCESS || bytes == 0) return {};
+  std::string text(bytes, '\0');
+  if (clGetDeviceInfo(device, query, bytes, text.data(), nullptr) != CL_SUCCESS) return {};
+  while (!text.empty() && text.back() == '\0') text.pop_back();
+  return text;
+}
+
+std::string cl_text_platform(cl_platform_id platform, cl_platform_info query) {
+  size_t bytes = 0;
+  if (clGetPlatformInfo(platform, query, 0, nullptr, &bytes) != CL_SUCCESS || bytes == 0) return {};
+  std::string text(bytes, '\0');
+  if (clGetPlatformInfo(platform, query, bytes, text.data(), nullptr) != CL_SUCCESS) return {};
+  while (!text.empty() && text.back() == '\0') text.pop_back();
+  return text;
+}
+
+std::string lower_ascii(std::string text) {
+  for (char& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return text;
+}
+
+bool vendor_match(Vendor want, const std::string& vendor, const std::string& name,
+                  const std::string& platform) {
+  if (want == Vendor::Auto) return true;
+  const std::string blob = lower_ascii(vendor + "\n" + name + "\n" + platform);
+  switch (want) {
+    case Vendor::Radeon:
+      return blob.find("radeon") != std::string::npos || blob.find("amd") != std::string::npos ||
+             blob.find("advanced micro") != std::string::npos;
+    case Vendor::Intel:
+      return blob.find("intel") != std::string::npos;
+    case Vendor::Apple:
+      return blob.find("apple") != std::string::npos;
+    case Vendor::Nvidia:
+      return blob.find("nvidia") != std::string::npos;
+    case Vendor::Auto:
+      return true;
+  }
+  return false;
+}
+
+bool work_group_ok(cl_device_id device) {
+  size_t max_wg = 0;
+  if (clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, nullptr) !=
+      CL_SUCCESS) {
+    return false;
+  }
+  return max_wg >= 256;
+}
+
+// A device that reports OpenCL C 2.0 or 3.0 is built as C 2.0.
+// NVIDIA and Apple report 1.2, so the program is built as C 1.2.
+bool opencl_c_at_least_2(cl_device_id device) {
+  const std::string text = cl_text_device(device, CL_DEVICE_OPENCL_C_VERSION);
+  const std::string key = "OpenCL C ";
+  const size_t pos = text.find(key);
+  if (pos == std::string::npos || pos + key.size() >= text.size()) return false;
+  const char major = text[pos + key.size()];
+  return major >= '2' && major <= '9';
+}
+
+std::string program_options(cl_device_id device, bool fp64) {
+  std::string options = opencl_c_at_least_2(device) ? "-cl-std=CL2.0" : "-cl-std=CL1.2";
+  if (fp64) options += " -DHAVE_FP64=1";
+  return options;
+}
+
+bool take_device(cl_device_id candidate, cl_context& context, cl_device_id& device) {
+  cl_int err = CL_SUCCESS;
+  cl_context trial = clCreateContext(nullptr, 1, &candidate, nullptr, nullptr, &err);
+  if (err != CL_SUCCESS || !trial) return false;
+  if (!work_group_ok(candidate)) {
+    clReleaseContext(trial);
+    return false;
+  }
+  context = trial;
+  device = candidate;
+  return true;
+}
+
+void consider_devices(cl_platform_id platform, cl_device_type type, Vendor want, cl_context& context,
+                      cl_device_id& device) {
+  if (context) return;
+  cl_uint ndev = 0;
+  cl_int err = clGetDeviceIDs(platform, type, 0, nullptr, &ndev);
+  if (err != CL_SUCCESS || ndev == 0) return;
+  std::vector<cl_device_id> devices(ndev);
+  err = clGetDeviceIDs(platform, type, ndev, devices.data(), nullptr);
+  if (err != CL_SUCCESS) return;
+  const std::string platform_vendor = cl_text_platform(platform, CL_PLATFORM_VENDOR);
+  for (cl_device_id candidate : devices) {
+    if (context) return;
+    const std::string vendor = cl_text_device(candidate, CL_DEVICE_VENDOR);
+    const std::string name = cl_text_device(candidate, CL_DEVICE_NAME);
+    if (!vendor_match(want, vendor, name, platform_vendor)) continue;
+    take_device(candidate, context, device);
+  }
+}
+
 std::string read_file(const char* path) {
   std::ifstream in(path);
   if (!in) throw Error("OpenCL program");
@@ -200,27 +319,15 @@ void Context::Impl::open() {
   if (err != CL_SUCCESS || nplat == 0) throw Error("OpenCL device");
   std::vector<cl_platform_id> platforms(nplat);
   check_cl(clGetPlatformIDs(nplat, platforms.data(), nullptr), "clGetPlatformIDs");
+  const Vendor want = compiled_vendor();
   for (cl_platform_id platform : platforms) {
-    cl_uint ndev = 0;
-    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &ndev);
-    if (err != CL_SUCCESS || ndev == 0) continue;
-    std::vector<cl_device_id> devices(ndev);
-    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, ndev, devices.data(), nullptr);
-    if (err != CL_SUCCESS) continue;
-    for (cl_device_id candidate : devices) {
-      cl_context trial = clCreateContext(nullptr, 1, &candidate, nullptr, nullptr, &err);
-      if (err != CL_SUCCESS || !trial) continue;
-      size_t max_wg = 0;
-      clGetDeviceInfo(candidate, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, nullptr);
-      if (max_wg < 256) {
-        clReleaseContext(trial);
-        continue;
-      }
-      context = trial;
-      device = candidate;
-      break;
+    consider_devices(platform, CL_DEVICE_TYPE_GPU, want, context, device);
+  }
+  // Intel's ICD on a machine with no Intel GPU is the CPU runtime.
+  if (!context && want == Vendor::Intel) {
+    for (cl_platform_id platform : platforms) {
+      consider_devices(platform, CL_DEVICE_TYPE_CPU, want, context, device);
     }
-    if (context) break;
   }
   if (!context) throw Error("OpenCL device");
 
@@ -244,8 +351,8 @@ void Context::Impl::open() {
   const size_t length = source.size();
   program = clCreateProgramWithSource(context, 1, &text, &length, &err);
   check_cl(err, "clCreateProgramWithSource");
-  const char* options = fp64 ? "-cl-std=CL2.0 -DHAVE_FP64=1" : "-cl-std=CL2.0";
-  err = clBuildProgram(program, 1, &device, options, nullptr, nullptr);
+  const std::string options = program_options(device, fp64);
+  err = clBuildProgram(program, 1, &device, options.c_str(), nullptr, nullptr);
   if (err != CL_SUCCESS) {
     size_t log_size = 0;
     clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
@@ -257,8 +364,13 @@ void Context::Impl::open() {
     throw Error(std::string("clBuildProgram: ") + cl_error_name(err) + " " + log);
   }
 
+#if CL_TARGET_OPENCL_VERSION >= 200
   queue = clCreateCommandQueueWithProperties(context, device, nullptr, &err);
   check_cl(err, "clCreateCommandQueueWithProperties");
+#else
+  queue = clCreateCommandQueue(context, device, 0, &err);
+  check_cl(err, "clCreateCommandQueue");
+#endif
   dummy = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(float), nullptr, &err);
   check_cl(err, "clCreateBuffer");
   const float zero = 0.f;

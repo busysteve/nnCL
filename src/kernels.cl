@@ -1,5 +1,8 @@
 // OpenCL C kernels for nnCL. One in-order queue. float32, row-major, NCHW.
+// OpenCL C 1.2 has no FP_CONTRACT pragma. NVIDIA and Apple report 1.2.
+#if defined(__OPENCL_C_VERSION__) && __OPENCL_C_VERSION__ >= 200
 #pragma OPENCL FP_CONTRACT OFF
+#endif
 
 float block_sum(float value, __local float* buffer) {
   const int tid = get_local_id(0);
