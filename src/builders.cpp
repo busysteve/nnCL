@@ -218,13 +218,18 @@ Network build_transformer_network(Context& ctx, const TransformerConfig& config,
     spec.bias = config.bias;
     spec.use_rope = config.positional == PositionalEncoding::Rope;
     spec.activation = config.activation;
+    spec.head_dim = config.head_dim;
+    spec.num_kv_heads = config.num_kv_heads;
+    spec.qk_norm = config.qk_norm;
+    spec.rope_theta = config.rope_theta;
+    spec.rms_eps = config.rms_eps;
     auto block = std::make_unique<TransformerBlock>(ctx, spec, rng);
     block->set_name(index_name("blocks", static_cast<size_t>(i)));
     layers.push_back(std::move(block));
   }
   std::unique_ptr<Layer> final_ln;
   if (config.positional == PositionalEncoding::Rope) {
-    final_ln = std::make_unique<RMSNorm>(ctx, config.d_model);
+    final_ln = std::make_unique<RMSNorm>(ctx, config.d_model, config.rms_eps);
   } else {
     final_ln = std::make_unique<LayerNorm>(ctx, config.d_model);
   }

@@ -46,6 +46,11 @@ Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t
   block_spec.activation = config.activation;
   const bool rope = config.positional == PositionalEncoding::Rope;
   block_spec.use_rope = rope;
+  block_spec.head_dim = config.head_dim;
+  block_spec.num_kv_heads = config.num_kv_heads;
+  block_spec.qk_norm = config.qk_norm;
+  block_spec.rope_theta = config.rope_theta;
+  block_spec.rms_eps = config.rms_eps;
 
   std::vector<std::unique_ptr<Layer>> layers;
   for (int i = 0; i < config.num_layers; ++i) {
@@ -56,7 +61,7 @@ Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t
   }
   std::unique_ptr<Layer> final_ln;
   if (rope) {
-    final_ln = std::make_unique<RMSNorm>(ctx, config.d_model);
+    final_ln = std::make_unique<RMSNorm>(ctx, config.d_model, config.rms_eps);
   } else {
     final_ln = std::make_unique<LayerNorm>(ctx, config.d_model);
   }

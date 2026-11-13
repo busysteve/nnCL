@@ -857,6 +857,7 @@ int test_checkpoint() {
     }
     const std::filesystem::path path = dir / "facade-rope.bin";
     model.save(path, nullptr);
+    CHECK(read_u32(read_bytes(path), 4) == 1);
     nn::IndexTensor tokens(ctx, {1, 3});
     const std::vector<int64_t> ids = {1, 0, 2};
     tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
@@ -869,6 +870,69 @@ int test_checkpoint() {
                   params[i].name.c_str());
     }
     expect_bits(loaded.model.forward(tokens).to_host(), logits, "rope logits");
+  }
+  {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 4;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = false;
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.positional = nn::PositionalEncoding::Rope;
+    config.head_dim = 4;
+    config.num_kv_heads = 2;
+    config.qk_norm = true;
+    config.rope_theta = 1000000.f;
+    config.rms_eps = 1e-6f;
+    nn::Transformer model(ctx, config, 5);
+    const std::vector<nn::NamedParam> params = model.parameters();
+    bool saw_q = false;
+    bool saw_k = false;
+    for (const nn::NamedParam& param : params) {
+      if (param.name == "blocks.0.attn.q_norm.weight") {
+        saw_q = true;
+        CHECK(param.value->shape() == std::vector<int>{4});
+      }
+      if (param.name == "blocks.0.attn.k_norm.weight") {
+        saw_k = true;
+        CHECK(param.value->shape() == std::vector<int>{4});
+      }
+      if (param.name == "blocks.0.attn.q.weight") CHECK((param.value->shape() == std::vector<int>{16, 8}));
+      if (param.name == "blocks.0.attn.k.weight") CHECK((param.value->shape() == std::vector<int>{8, 8}));
+    }
+    CHECK(saw_q);
+    CHECK(saw_k);
+
+    const std::filesystem::path path = dir / "facade-qwen.bin";
+    model.save(path, nullptr);
+    CHECK(read_u32(read_bytes(path), 4) == 3);
+    nn::IndexTensor tokens(ctx, {1, 3});
+    const std::vector<int64_t> ids = {1, 0, 2};
+    tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+    const std::vector<float> logits = model.forward(tokens).to_host();
+    nn::Transformer::Loaded loaded = nn::Transformer::load(ctx, path, nn::LoadMode::Inference);
+    CHECK(loaded.model.parameters().size() == params.size());
+    for (size_t i = 0; i < params.size(); ++i) {
+      CHECK(loaded.model.parameters()[i].name == params[i].name);
+      expect_bits(loaded.model.parameters()[i].value->to_host(), params[i].value->to_host(),
+                  params[i].name.c_str());
+    }
+    expect_bits(loaded.model.forward(tokens).to_host(), logits, "qwen logits");
+
+    nn::AdamW optimizer = make_facade_adamw(model);
+    step_facade_adamw(model, optimizer, ctx);
+    const std::filesystem::path adamw_path = dir / "facade-qwen-adamw.bin";
+    model.save(adamw_path, &optimizer);
+    CHECK(read_u32(read_bytes(adamw_path), 4) == 4);
+    nn::Context ctx_b;
+    nn::Transformer::Loaded resumed = nn::Transformer::load(ctx_b, adamw_path, nn::LoadMode::Resume);
+    CHECK(resumed.adamw.has_value());
+    CHECK(resumed.step == 1);
+    compare_facade_adamw(model, resumed.model, optimizer, *resumed.adamw);
   }
 
   std::printf("ckpt ok\n");

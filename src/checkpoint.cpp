@@ -20,6 +20,8 @@ namespace {
 constexpr uint32_t kMagic = 0x314E4E43u;
 constexpr uint32_t kVersion = 1u;
 constexpr uint32_t kVersionAdamW = 2u;
+constexpr uint32_t kVersionExt = 3u;
+constexpr uint32_t kVersionExtAdamW = 4u;
 constexpr uint32_t kKindSgd = 1u;
 constexpr uint32_t kKindAdamW = 2u;
 constexpr uint32_t kFloat32 = 1u;
@@ -211,7 +213,7 @@ std::vector<uint8_t> read_file(const std::filesystem::path& path) {
   return bytes;
 }
 
-Header read_header(ByteReader& reader, uint32_t max_version = kVersionAdamW) {
+Header read_header(ByteReader& reader, uint32_t max_version = kVersionExtAdamW) {
   const uint32_t magic = reader.u32();
   if (magic != kMagic) throw Error("bad checkpoint magic");
   const uint32_t version = reader.u32();
@@ -232,8 +234,20 @@ Header read_header(ByteReader& reader, uint32_t max_version = kVersionAdamW) {
   return header;
 }
 
+bool transformer_extended(const TransformerConfig& config) {
+  const bool wide = config.head_dim > 0 &&
+                    (config.d_model % config.num_heads != 0 || config.head_dim != config.d_model / config.num_heads);
+  const bool grouped = config.num_kv_heads > 0 && config.num_kv_heads != config.num_heads;
+  return wide || grouped || config.qk_norm || config.rope_theta != 10000.f || config.rms_eps != 1e-5f;
+}
+
+uint32_t transformer_file_version(const TransformerConfig& config, bool kind_word) {
+  if (!transformer_extended(config)) return kind_word ? kVersionAdamW : kVersion;
+  return kind_word ? kVersionExtAdamW : kVersionExt;
+}
+
 std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig, TransformerConfig>
-read_config(ByteReader& reader, uint32_t family) {
+read_config(ByteReader& reader, uint32_t family, uint32_t version) {
   if (family == 1) {
     MlpConfig config;
     config.input_size = reader.i32();
@@ -348,6 +362,13 @@ read_config(ByteReader& reader, uint32_t family) {
     config.bias = reader.u32() != 0;
     config.activation = static_cast<TransformerActivation>(reader.u32());
     config.positional = static_cast<PositionalEncoding>(reader.u32());
+    if (version >= kVersionExt) {
+      config.head_dim = reader.i32();
+      config.num_kv_heads = reader.i32();
+      config.qk_norm = reader.u32() != 0;
+      config.rope_theta = reader.f32();
+      config.rms_eps = reader.f32();
+    }
     reader.pad8();
     validate(config);
     return config;
@@ -455,7 +476,7 @@ void require_match(const ParsedParam& parsed, const NamedParam& param) {
   }
 }
 
-void write_transformer_config(ByteWriter& writer, const TransformerConfig& config) {
+void write_transformer_config(ByteWriter& writer, const TransformerConfig& config, bool extended) {
   writer.i32(config.vocab_size);
   writer.i32(config.d_model);
   writer.i32(config.num_heads);
@@ -467,6 +488,13 @@ void write_transformer_config(ByteWriter& writer, const TransformerConfig& confi
   writer.u32(config.bias ? 1u : 0u);
   writer.u32(static_cast<uint32_t>(config.activation));
   writer.u32(static_cast<uint32_t>(config.positional));
+  if (extended) {
+    writer.i32(config.head_dim);
+    writer.i32(config.num_kv_heads);
+    writer.u32(config.qk_norm ? 1u : 0u);
+    writer.f32(config.rope_theta);
+    writer.f32(config.rms_eps);
+  }
 }
 
 void write_params(ByteWriter& writer, const std::vector<NamedParam>& params) {
@@ -679,7 +707,7 @@ void write_model(ByteWriter& writer, const Network& network, uint32_t version, u
           for (int width : config.hidden) writer.i32(width);
         } else {
           static_assert(std::is_same_v<T, TransformerConfig>);
-          write_transformer_config(writer, config);
+          write_transformer_config(writer, config, version >= kVersionExt);
         }
       },
       network.config());
@@ -719,7 +747,10 @@ void Network::save(const std::filesystem::path& path, const Sgd* optimizer) cons
   if (optimizer) require_owned_by(*this, optimizer->params());
   ctx_->synchronize();
   ByteWriter writer;
-  write_model(writer, *this, kVersion, optimizer ? optimizer->step_count() : 0, optimizer ? 1u : 0u);
+  const uint32_t version = std::holds_alternative<TransformerConfig>(config())
+                               ? transformer_file_version(std::get<TransformerConfig>(config()), false)
+                               : kVersion;
+  write_model(writer, *this, version, optimizer ? optimizer->step_count() : 0, optimizer ? 1u : 0u);
   if (optimizer) write_optimizer_sgd(writer, *optimizer);
   commit_checkpoint(path, writer.bytes());
 }
@@ -729,8 +760,10 @@ void Network::save(const std::filesystem::path& path, const AdamW* optimizer) co
   if (optimizer) require_owned_by(*this, flat_params(*optimizer));
   ctx_->synchronize();
   ByteWriter writer;
-  write_model(writer, *this, kVersionAdamW, optimizer ? optimizer->step_count() : 0,
-              optimizer ? 1u : 0u);
+  const uint32_t version = std::holds_alternative<TransformerConfig>(config())
+                               ? transformer_file_version(std::get<TransformerConfig>(config()), true)
+                               : kVersionAdamW;
+  write_model(writer, *this, version, optimizer ? optimizer->step_count() : 0, optimizer ? 1u : 0u);
   if (optimizer) write_optimizer_adamw(writer, *optimizer);
   commit_checkpoint(path, writer.bytes());
 }
@@ -738,14 +771,14 @@ void Network::save(const std::filesystem::path& path, const AdamW* optimizer) co
 Network::Loaded Network::load(Context& ctx, const std::filesystem::path& path, LoadMode mode) {
   ByteReader reader(read_file(path));
   const Header header = read_header(reader);
-  auto config = read_config(reader, header.family);
+  auto config = read_config(reader, header.family, header.version);
   uint32_t param_count = 0;
   const std::vector<ParsedParam> parsed_params = read_params(reader, &param_count);
   const std::vector<ParsedBn> parsed_bn = read_bn(reader);
   std::optional<ParsedOpt> parsed_sgd;
   std::optional<ParsedAdamW> parsed_adamw;
   if (header.optimizer_present) {
-    if (header.version == kVersion) {
+    if (header.version == kVersion || header.version == kVersionExt) {
       parsed_sgd = read_opt(reader, parsed_params);
     } else {
       const uint32_t kind = reader.u32();
@@ -826,13 +859,13 @@ void Transformer::save(const std::filesystem::path& path, const Sgd* optimizer) 
 
   ByteWriter writer;
   writer.u32(kMagic);
-  writer.u32(optimizer ? 2u : kVersion);
+  writer.u32(transformer_file_version(config, optimizer != nullptr));
   writer.u32(static_cast<uint32_t>(network().family()));
   writer.u32(training() ? 1u : 0u);
   writer.u64(optimizer ? optimizer->step_count() : 0);
   writer.u32(optimizer ? 1u : 0u);
   writer.u32(0);
-  write_transformer_config(writer, config);
+  write_transformer_config(writer, config, transformer_extended(config));
   writer.pad8();
   write_params(writer, params);
   write_bn(writer, {});
@@ -859,13 +892,13 @@ void Transformer::save(const std::filesystem::path& path, const AdamW* optimizer
 
   ByteWriter writer;
   writer.u32(kMagic);
-  writer.u32(kVersionAdamW);
+  writer.u32(transformer_file_version(config, true));
   writer.u32(static_cast<uint32_t>(network().family()));
   writer.u32(training() ? 1u : 0u);
   writer.u64(optimizer ? optimizer->step_count() : 0);
   writer.u32(optimizer ? 1u : 0u);
   writer.u32(0);
-  write_transformer_config(writer, config);
+  write_transformer_config(writer, config, transformer_extended(config));
   writer.pad8();
   write_params(writer, params);
   write_bn(writer, {});
@@ -875,9 +908,9 @@ void Transformer::save(const std::filesystem::path& path, const AdamW* optimizer
 
 Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path& path, LoadMode mode) {
   ByteReader reader(read_file(path));
-  const Header header = read_header(reader, 2u);
+  const Header header = read_header(reader, kVersionExtAdamW);
   if (header.family != static_cast<uint32_t>(Family::Transformer)) throw Error("bad checkpoint family");
-  const auto config_var = read_config(reader, header.family);
+  const auto config_var = read_config(reader, header.family, header.version);
   const TransformerConfig& config = std::get<TransformerConfig>(config_var);
   uint32_t param_count = 0;
   const std::vector<ParsedParam> parsed_params = read_params(reader, &param_count);
@@ -886,7 +919,7 @@ Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path&
   std::optional<ParsedOpt> parsed_opt;
   std::optional<ParsedAdamW> parsed_adamw;
   if (header.optimizer_present) {
-    if (header.version == 2u) {
+    if (header.version == kVersionAdamW || header.version == kVersionExtAdamW) {
       const uint32_t kind = reader.u32();
       if (kind == kKindSgd) parsed_opt = read_opt(reader, parsed_params);
       else if (kind == kKindAdamW) parsed_adamw = read_adamw(reader, parsed_params);

@@ -491,6 +491,39 @@ __kernel void split_heads(__global float* dst, __global const float* src, int ti
   dst[o] = src[i];
 }
 
+__kernel void repeat_kv(__global float* dst, __global const float* src, int time, int kv_heads, int group,
+                        int dh, long n) {
+  const long i = (long)get_global_id(0);
+  if (i >= n) return;
+  // dst and src are (N, heads, T, Dh). The head axis is outside time.
+  const int heads = kv_heads * group;
+  const long d = i % dh;
+  const long t = (i / dh) % time;
+  const long h = (i / ((long)dh * time)) % heads;
+  const long batch = i / ((long)dh * time * heads);
+  const long hkv = h / group;
+  const long s = ((batch * kv_heads + hkv) * time + t) * dh + d;
+  dst[i] = src[s];
+}
+
+__kernel void sum_kv(__global float* dst, __global const float* src, int time, int kv_heads, int group,
+                     int dh, long n) {
+  const long i = (long)get_global_id(0);
+  if (i >= n) return;
+  const int heads = kv_heads * group;
+  const long d = i % dh;
+  const long t = (i / dh) % time;
+  const long hkv = (i / ((long)dh * time)) % kv_heads;
+  const long batch = i / ((long)dh * time * kv_heads);
+  float sum = 0.f;
+  for (int g = 0; g < group; ++g) {
+    const long h = (long)hkv * group + g;
+    const long s = ((batch * heads + h) * time + t) * dh + d;
+    sum += src[s];
+  }
+  dst[i] = sum;
+}
+
 __kernel void merge_heads(__global float* dst, __global const float* src, int time, int heads,
                           int dh, long n) {
   const long i = (long)get_global_id(0);
@@ -504,7 +537,7 @@ __kernel void merge_heads(__global float* dst, __global const float* src, int ti
 }
 
 __kernel void rope_qk(__global float* q, __global float* k, int time, int dh, int pos0, long npairs,
-                      int inverse) {
+                      int inverse, float base_theta) {
   const long pair_index = (long)get_global_id(0);
   if (pair_index >= npairs) return;
   const int pairs = dh / 2;
@@ -513,7 +546,7 @@ __kernel void rope_qk(__global float* q, __global float* k, int time, int dh, in
   const int t = (int)(vec % time);
   const long base = vec * dh + (long)pair * 2;
   const float theta = (float)(pos0 + t) *
-                      exp(-log(10000.f) * (2.f * divf((float)pair, (float)dh)));
+                      exp(-log(base_theta) * (2.f * divf((float)pair, (float)dh)));
   const float c = cos(theta);
   const float s = sin(theta);
   const float q0 = q[base];

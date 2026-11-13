@@ -815,7 +815,7 @@ void launch_merge_heads(Context& ctx, float* dst, const float* src, int time, in
 }
 
 void launch_rope(Context& ctx, float* q, float* k, int time, int dh, int pos0, int64_t npairs,
-                 int inverse) {
+                 int inverse, float base_theta) {
   KernelCall(ctx, "rope_qk")
       .mem(mem_of(q))
       .mem(mem_of(k))
@@ -824,7 +824,34 @@ void launch_rope(Context& ctx, float* q, float* k, int time, int dh, int pos0, i
       .i(pos0)
       .l(static_cast<cl_long>(npairs))
       .i(inverse)
+      .f(base_theta)
       .over(npairs, 256);
+}
+
+void launch_repeat_kv(Context& ctx, float* dst, const float* src, int time, int kv_heads, int group,
+                      int dh, int64_t n) {
+  KernelCall(ctx, "repeat_kv")
+      .mem(mem_of(dst))
+      .mem(mem_of(src))
+      .i(time)
+      .i(kv_heads)
+      .i(group)
+      .i(dh)
+      .l(static_cast<cl_long>(n))
+      .over(n, 256);
+}
+
+void launch_sum_kv(Context& ctx, float* dst, const float* src, int time, int kv_heads, int group, int dh,
+                   int64_t n) {
+  KernelCall(ctx, "sum_kv")
+      .mem(mem_of(dst))
+      .mem(mem_of(src))
+      .i(time)
+      .i(kv_heads)
+      .i(group)
+      .i(dh)
+      .l(static_cast<cl_long>(n))
+      .over(n, 256);
 }
 
 void launch_causal_mask(Context& ctx, float* scores, int time, int64_t n) {

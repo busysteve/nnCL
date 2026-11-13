@@ -46,7 +46,8 @@ class Transformer {
 
   void save(const std::filesystem::path& path, const Sgd* optimizer) const;
   void save(const std::filesystem::path& path, const AdamW* optimizer) const;
-  // nullptr stays version 1. An AdamW* (including null) is version 2.
+  // nullptr stays version 1, or version 3 when the block is Qwen-style.
+  // An AdamW* (including null) is version 2, or version 4 for that block.
   void save(const std::filesystem::path& path, std::nullptr_t) const {
     save(path, static_cast<const Sgd*>(nullptr));
   }

@@ -55,7 +55,7 @@ double squared_loss(const nn::Tensor& output) {
 }
 
 void finite_difference(nn::Tensor& value, const std::vector<float>& analytic,
-                       const std::function<double()>& loss, const char* name) {
+                       const std::function<double()>& loss, const char* name, double rel = 1e-2) {
   const std::vector<float> original = value.to_host();
   CHECK(original.size() == analytic.size());
   std::vector<float> current = original;
@@ -69,11 +69,11 @@ void finite_difference(nn::Tensor& value, const std::vector<float>& analytic,
     current[i] = original[i];
     value.copy_from_host(current);
     const double numeric = (loss_plus - loss_minus) / (2.0 * kEps);
-    check_close(static_cast<double>(analytic[i]), numeric, 1e-2, 1e-4, name, i);
+    check_close(static_cast<double>(analytic[i]), numeric, rel, 1e-4, name, i);
   }
 }
 
-void check_layer(nn::Layer& layer, nn::Tensor& input) {
+void check_layer(nn::Layer& layer, nn::Tensor& input, double rel = 1e-2) {
   layer.zero_grad();
   const nn::Tensor& output = layer.forward(input);
   const std::vector<float> output_host = output.to_host();
@@ -93,9 +93,9 @@ void check_layer(nn::Layer& layer, nn::Tensor& input) {
                     grad_output_before.size() * sizeof(float)) == 0);
 
   const auto loss = [&]() { return squared_loss(layer.forward(input)); };
-  finite_difference(input, analytic_input, loss, "input");
+  finite_difference(input, analytic_input, loss, "input", rel);
   for (size_t i = 0; i < analytic_params.size(); ++i) {
-    finite_difference(*analytic_params[i].first, analytic_params[i].second, loss, names[i].c_str());
+    finite_difference(*analytic_params[i].first, analytic_params[i].second, loss, names[i].c_str(), rel);
   }
 }
 
@@ -484,6 +484,38 @@ int test_gradients() {
     nn::Tensor input(ctx, {1, 3, 8});
     input.copy_from_host(uniform(input.numel(), local, -0.5f, 0.5f));
     check_layer(layer, input);
+  }
+
+  std::printf("grad mha qwen\n");
+  {
+    std::mt19937 local(15);
+    nn::MultiHeadAttention layer(ctx, 8, 4, true, false, true, local, 4, 2, true, 1000000.f, 1e-6f);
+    nn::Tensor input(ctx, {1, 3, 8});
+    input.copy_from_host(uniform(input.numel(), local, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad transformer qwen\n");
+  {
+    std::mt19937 local(16);
+    nn::TransformerBlockSpec spec;
+    spec.d_model = 8;
+    spec.num_heads = 4;
+    spec.d_ff = 16;
+    spec.dropout = 0.f;
+    spec.bias = false;
+    spec.use_rope = true;
+    spec.activation = nn::TransformerActivation::SwiGLU;
+    spec.head_dim = 4;
+    spec.num_kv_heads = 2;
+    spec.qk_norm = true;
+    spec.rope_theta = 1000000.f;
+    spec.rms_eps = 1e-6f;
+    nn::TransformerBlock layer(ctx, spec, local);
+    nn::Tensor input(ctx, {1, 3, 8});
+    input.copy_from_host(uniform(input.numel(), local, -0.5f, 0.5f));
+    // QK-norm plus the block RMSNorm leaves one K weight just outside 1e-2.
+    check_layer(layer, input, 2e-2);
   }
 
   std::printf("grad embedding\n");

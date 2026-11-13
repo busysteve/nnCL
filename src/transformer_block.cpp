@@ -26,10 +26,16 @@ void append_params(std::vector<NamedParam>& out, const Layer& layer, const std::
 }
 
 void require_block_spec(const TransformerBlockSpec& spec) {
-  if (spec.d_model < 1 || spec.num_heads < 1 || spec.d_ff < 1 ||
-      spec.d_model % spec.num_heads != 0) {
+  if (spec.d_model < 1 || spec.num_heads < 1 || spec.d_ff < 1) throw Error("TransformerBlock size");
+  const int head_dim = spec.head_dim == 0 ? spec.d_model / spec.num_heads : spec.head_dim;
+  const int kv = spec.num_kv_heads == 0 ? spec.num_heads : spec.num_kv_heads;
+  if (spec.head_dim == 0 && spec.d_model % spec.num_heads != 0) throw Error("TransformerBlock size");
+  if (head_dim < 1 || kv < 1 || kv > spec.num_heads || spec.num_heads % kv != 0) {
     throw Error("TransformerBlock size");
   }
+  if (spec.use_rope && head_dim % 2 != 0) throw std::invalid_argument("use_rope");
+  if (!(spec.rope_theta > 0.f) || !std::isfinite(spec.rope_theta)) throw std::invalid_argument("rope_theta");
+  if (!(spec.rms_eps > 0.f) || !std::isfinite(spec.rms_eps)) throw std::invalid_argument("rms_eps");
   if (!(spec.dropout >= 0.f) || !(spec.dropout < 1.f) || !std::isfinite(spec.dropout)) {
     throw Error("TransformerBlock dropout");
   }
@@ -51,15 +57,16 @@ TransformerBlock::TransformerBlock(Context& ctx, const TransformerBlockSpec& spe
   const bool swiglu = spec.activation == TransformerActivation::SwiGLU;
   const int fc1_out = swiglu ? spec.d_ff * 2 : spec.d_ff;
   if (spec.use_rope) {
-    ln1_ = std::make_unique<RMSNorm>(ctx, spec.d_model);
+    ln1_ = std::make_unique<RMSNorm>(ctx, spec.d_model, spec.rms_eps);
   } else {
     ln1_ = std::make_unique<LayerNorm>(ctx, spec.d_model);
   }
   mha_ = std::make_unique<MultiHeadAttention>(ctx, spec.d_model, spec.num_heads, true, spec.bias,
-                                              spec.use_rope, rng);
+                                              spec.use_rope, rng, spec.head_dim, spec.num_kv_heads,
+                                              spec.qk_norm, spec.rope_theta, spec.rms_eps);
   drop1_ = std::make_unique<Dropout>(ctx, spec.dropout);
   if (spec.use_rope) {
-    ln2_ = std::make_unique<RMSNorm>(ctx, spec.d_model);
+    ln2_ = std::make_unique<RMSNorm>(ctx, spec.d_model, spec.rms_eps);
   } else {
     ln2_ = std::make_unique<LayerNorm>(ctx, spec.d_model);
   }

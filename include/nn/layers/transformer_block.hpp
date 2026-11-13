@@ -21,6 +21,11 @@ struct TransformerBlockSpec {
   bool bias = false;
   bool use_rope = false;  // RMSNorm, and adjacent-pair RoPE on Q and K. Odd head dim throws.
   TransformerActivation activation = TransformerActivation::SwiGLU;
+  int head_dim = 0;       // 0 => d_model / num_heads. Qwen3 uses a wider head.
+  int num_kv_heads = 0;   // 0 => num_heads. Smaller means grouped-query attention.
+  bool qk_norm = false;
+  float rope_theta = 10000.f;
+  float rms_eps = 1e-5f;
 };
 
 class TransformerBlock : public Layer {

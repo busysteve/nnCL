@@ -80,6 +80,12 @@ struct TransformerConfig {
   bool bias = false;
   TransformerActivation activation = TransformerActivation::SwiGLU;
   PositionalEncoding positional = PositionalEncoding::LearnedAbsolute;
+  // 0 keeps head_dim = d_model / num_heads and one KV head per query head.
+  int head_dim = 0;
+  int num_kv_heads = 0;
+  bool qk_norm = false;      // RMSNorm on Q and K, width head_dim, before RoPE
+  float rope_theta = 10000.f;
+  float rms_eps = 1e-5f;
 };
 
 int conv_out_size(int in, int kernel, int stride, int pad);

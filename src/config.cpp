@@ -1,6 +1,7 @@
 #include "nn/config.hpp"
 
 #include <climits>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -126,7 +127,15 @@ void validate(const TransformerConfig& config) {
   require_positive(config.num_layers, "num_layers");
   require_positive(config.d_ff, "d_ff");
   require_positive(config.max_seq_len, "max_seq_len");
-  if (config.d_model % config.num_heads != 0) bad("num_heads");
+  if (config.head_dim == 0) {
+    if (config.d_model % config.num_heads != 0) bad("num_heads");
+  } else if (config.head_dim < 1) {
+    bad("head_dim");
+  }
+  const int head_dim = config.head_dim == 0 ? config.d_model / config.num_heads : config.head_dim;
+  const int kv_heads = config.num_kv_heads == 0 ? config.num_heads : config.num_kv_heads;
+  if (kv_heads < 1 || kv_heads > config.num_heads || config.num_heads % kv_heads != 0) bad("num_kv_heads");
+  if (head_dim > INT_MAX / config.num_heads || head_dim > INT_MAX / kv_heads) bad("head_dim");
   if (!(config.dropout >= 0.f) || !(config.dropout < 1.f)) bad("dropout");
   if (config.tie_embeddings) bad("tie_embeddings");
   if (config.activation != TransformerActivation::Gelu &&
@@ -134,10 +143,12 @@ void validate(const TransformerConfig& config) {
     bad("activation");
   }
   if (config.positional == PositionalEncoding::Rope) {
-    if ((config.d_model / config.num_heads) % 2 != 0) bad("use_rope");
+    if (head_dim % 2 != 0) bad("use_rope");
   } else if (config.positional != PositionalEncoding::LearnedAbsolute) {
     bad("positional");
   }
+  if (!(config.rope_theta > 0.f) || !std::isfinite(config.rope_theta)) bad("rope_theta");
+  if (!(config.rms_eps > 0.f) || !std::isfinite(config.rms_eps)) bad("rms_eps");
   if (config.activation == TransformerActivation::SwiGLU && config.d_ff > INT_MAX / 2) bad("d_ff");
 }
 

@@ -132,7 +132,11 @@ void launch_split_heads(Context& ctx, float* dst, const float* src, int time, in
 void launch_merge_heads(Context& ctx, float* dst, const float* src, int time, int heads, int dh,
                         int64_t n);
 void launch_rope(Context& ctx, float* q, float* k, int time, int dh, int pos0, int64_t npairs,
-                 int inverse);
+                 int inverse, float base_theta);
+void launch_repeat_kv(Context& ctx, float* dst, const float* src, int time, int kv_heads, int group,
+                      int dh, int64_t n);
+void launch_sum_kv(Context& ctx, float* dst, const float* src, int time, int kv_heads, int group, int dh,
+                   int64_t n);
 void launch_causal_mask(Context& ctx, float* scores, int time, int64_t n);
 void launch_write_kv(Context& ctx, float* dst, const float* src, int t, int t_max, int dh,
                      int64_t n);
