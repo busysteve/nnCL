@@ -26,6 +26,29 @@ const TransformerConfig& transformer_config(const Network& network) {
   return std::get<TransformerConfig>(network.config());
 }
 
+void copy_ids(IndexTensor& dst, const std::vector<int64_t>& host, Context& ctx) {
+  dst.copy_from_host(host.data(), dst.numel());
+  ctx.synchronize();
+}
+
+const Tensor& add_embeddings(Context& ctx, const Tensor& tok, const Tensor* pos, const Tensor* typ,
+                             std::optional<Tensor>& dst, std::optional<Tensor>& scratch) {
+  if (pos != nullptr && typ != nullptr) {
+    ensure_tensor(scratch, ctx, tok.shape());
+    launch_add2(ctx, scratch->data(), tok.data(), pos->data(), tok.numel());
+    ensure_tensor(dst, ctx, tok.shape());
+    launch_add2(ctx, dst->data(), scratch->data(), typ->data(), tok.numel());
+    return *dst;
+  }
+  if (pos != nullptr || typ != nullptr) {
+    const Tensor& extra = pos != nullptr ? *pos : *typ;
+    ensure_tensor(dst, ctx, tok.shape());
+    launch_add2(ctx, dst->data(), tok.data(), extra.data(), tok.numel());
+    return *dst;
+  }
+  return tok;
+}
+
 }  // namespace
 
 Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t seed) : ctx_(&ctx) {
@@ -36,6 +59,10 @@ Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t
   if (config.positional == PositionalEncoding::LearnedAbsolute) {
     pos_emb_ = std::make_unique<Embedding>(ctx, config.max_seq_len, config.d_model, rng);
     pos_emb_->set_name("pos_emb");
+  }
+  if (config.type_vocab_size > 0) {
+    type_emb_ = std::make_unique<Embedding>(ctx, config.type_vocab_size, config.d_model, rng);
+    type_emb_->set_name("type_emb");
   }
   TransformerBlockSpec block_spec;
   block_spec.d_model = config.d_model;
@@ -51,6 +78,7 @@ Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t
   block_spec.qk_norm = config.qk_norm;
   block_spec.rope_theta = config.rope_theta;
   block_spec.rms_eps = config.rms_eps;
+  block_spec.causal = config.causal;
 
   std::vector<std::unique_ptr<Layer>> layers;
   for (int i = 0; i < config.num_layers; ++i) {
@@ -75,14 +103,23 @@ Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t
   network_ = Network(ctx, Family::Transformer, std::move(layers), config);
 }
 
-const Tensor& Transformer::forward(const IndexTensor& tokens) {
+const Tensor& Transformer::forward(const IndexTensor& tokens) { return forward_tokens(tokens, nullptr); }
+
+const Tensor& Transformer::forward(const IndexTensor& tokens, const IndexTensor& type_ids) {
+  if (!type_emb_) throw std::invalid_argument("type_ids");
+  if (type_ids.shape() != tokens.shape()) throw std::invalid_argument("type_ids");
+  return forward_tokens(tokens, &type_ids);
+}
+
+const Tensor& Transformer::forward_tokens(const IndexTensor& tokens, const IndexTensor* type_ids) {
   if (tokens.shape().size() != 2) throw std::invalid_argument("tokens");
+  if (type_ids != nullptr && !type_emb_) throw std::invalid_argument("type_ids");
   const int n = tokens.shape()[0];
   const int t = tokens.shape()[1];
   if (t > transformer_config(*network_).max_seq_len) throw std::invalid_argument("max_seq_len");
 
   const Tensor& tok = tok_emb_->forward_indices(tokens);
-  const Tensor* x = &tok;
+  const Tensor* pos = nullptr;
   if (pos_emb_) {
     if (!pos_ids_ || pos_ids_->shape()[0] != n || pos_ids_->shape()[1] != t) {
       pos_ids_.emplace(*ctx_, std::vector<int>{n, t});
@@ -92,15 +129,24 @@ const Tensor& Transformer::forward(const IndexTensor& tokens) {
           host[static_cast<size_t>(row) * static_cast<size_t>(t) + static_cast<size_t>(col)] = col;
         }
       }
-      pos_ids_->copy_from_host(host.data(), pos_ids_->numel());
-      ctx_->synchronize();
+      copy_ids(*pos_ids_, host, *ctx_);
     }
-    const Tensor& pos = pos_emb_->forward_indices(*pos_ids_);
-    ensure_tensor(embedded_, *ctx_, tok.shape());
-    launch_add2(*ctx_, embedded_->data(), tok.data(), pos.data(), tok.numel());
-    x = &*embedded_;
+    pos = &pos_emb_->forward_indices(*pos_ids_);
   }
-  const Tensor& logits = network_->forward(*x);
+  const Tensor* typ = nullptr;
+  if (type_emb_) {
+    const IndexTensor* ids = type_ids;
+    if (ids == nullptr) {
+      if (!type_zero_ || type_zero_->shape()[0] != n || type_zero_->shape()[1] != t) {
+        type_zero_.emplace(*ctx_, std::vector<int>{n, t});
+        copy_ids(*type_zero_, std::vector<int64_t>(static_cast<size_t>(type_zero_->numel()), 0), *ctx_);
+      }
+      ids = &*type_zero_;
+    }
+    typ = &type_emb_->forward_indices(*ids);
+  }
+  const Tensor& x = add_embeddings(*ctx_, tok, pos, typ, embedded_, embedded_pair_);
+  const Tensor& logits = network_->forward(x);
   forwarded_ = true;
   used_embeddings_ = true;
   return logits;
@@ -119,6 +165,7 @@ void Transformer::reset_generate_state(GenerateState& st, int batch, int t_max) 
 }
 
 const Tensor& Transformer::decode_step(const IndexTensor& next_ids, GenerateState& st) {
+  if (!transformer_config(*network_).causal) throw std::invalid_argument("causal");
   if (training()) throw std::invalid_argument("decode_step");
   if (&next_ids.context() != ctx_ || next_ids.shape().size() != 2 || next_ids.shape()[1] != 1) {
     throw std::invalid_argument("next_ids");
@@ -132,19 +179,23 @@ const Tensor& Transformer::decode_step(const IndexTensor& next_ids, GenerateStat
   if (st.t >= transformer_config(*network_).max_seq_len) throw std::invalid_argument("max_seq_len");
 
   const Tensor& tok = tok_emb_->forward_indices(next_ids);
-  const Tensor* x = &tok;
+  const Tensor* pos = nullptr;
   if (pos_emb_) {
     if (!pos_step_ids_ || pos_step_ids_->shape()[0] != n || pos_step_ids_->shape()[1] != 1) {
       pos_step_ids_.emplace(*ctx_, std::vector<int>{n, 1});
     }
-    std::vector<int64_t> host(static_cast<size_t>(n), static_cast<int64_t>(st.t));
-    pos_step_ids_->copy_from_host(host.data(), pos_step_ids_->numel());
-    ctx_->synchronize();
-    const Tensor& pos = pos_emb_->forward_indices(*pos_step_ids_);
-    ensure_tensor(embedded_step_, *ctx_, tok.shape());
-    launch_add2(*ctx_, embedded_step_->data(), tok.data(), pos.data(), tok.numel());
-    x = &*embedded_step_;
+    copy_ids(*pos_step_ids_, std::vector<int64_t>(static_cast<size_t>(n), static_cast<int64_t>(st.t)), *ctx_);
+    pos = &pos_emb_->forward_indices(*pos_step_ids_);
   }
+  const Tensor* typ = nullptr;
+  if (type_emb_) {
+    if (!type_step_ids_ || type_step_ids_->shape()[0] != n || type_step_ids_->shape()[1] != 1) {
+      type_step_ids_.emplace(*ctx_, std::vector<int>{n, 1});
+      copy_ids(*type_step_ids_, std::vector<int64_t>(static_cast<size_t>(n), 0), *ctx_);
+    }
+    typ = &type_emb_->forward_indices(*type_step_ids_);
+  }
+  const Tensor* x = &add_embeddings(*ctx_, tok, pos, typ, embedded_step_, embedded_step_pair_);
 
   for (size_t i = 0; i < block_ptrs_.size(); ++i) {
     x = &block_ptrs_[i]->forward_cached(*x, st.layer_caches[i]);
@@ -156,6 +207,7 @@ const Tensor& Transformer::decode_step(const IndexTensor& next_ids, GenerateStat
 }
 
 const Tensor& Transformer::prefill(const IndexTensor& prompt_ids, GenerateState& st, int t_max) {
+  if (!transformer_config(*network_).causal) throw std::invalid_argument("causal");
   if (prompt_ids.shape().size() != 2) throw std::invalid_argument("prompt_ids");
   const int n = prompt_ids.shape()[0];
   const int t_prompt = prompt_ids.shape()[1];
@@ -196,6 +248,7 @@ const Tensor& Transformer::backward(const Tensor& grad_logits) {
   if (used_embeddings_) {
     tok_emb_->backward(grad_x);
     if (pos_emb_) pos_emb_->backward(grad_x);
+    if (type_emb_) type_emb_->backward(grad_x);
   }
   return grad_x;
 }
@@ -203,18 +256,21 @@ const Tensor& Transformer::backward(const Tensor& grad_logits) {
 void Transformer::zero_grad() {
   tok_emb_->zero_grad();
   if (pos_emb_) pos_emb_->zero_grad();
+  if (type_emb_) type_emb_->zero_grad();
   network_->zero_grad();
 }
 
 void Transformer::train() {
   tok_emb_->set_training(true);
   if (pos_emb_) pos_emb_->set_training(true);
+  if (type_emb_) type_emb_->set_training(true);
   network_->train();
 }
 
 void Transformer::eval() {
   tok_emb_->set_training(false);
   if (pos_emb_) pos_emb_->set_training(false);
+  if (type_emb_) type_emb_->set_training(false);
   network_->eval();
 }
 
@@ -229,6 +285,12 @@ std::vector<NamedParam> Transformer::parameters() const {
   if (pos_emb_) {
     for (NamedParam param : pos_emb_->parameters()) {
       param.name = join_name(pos_emb_->name(), param.name);
+      params.push_back(param);
+    }
+  }
+  if (type_emb_) {
+    for (NamedParam param : type_emb_->parameters()) {
+      param.name = join_name(type_emb_->name(), param.name);
       params.push_back(param);
     }
   }

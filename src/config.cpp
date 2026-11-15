@@ -150,6 +150,7 @@ void validate(const TransformerConfig& config) {
   if (!(config.rope_theta > 0.f) || !std::isfinite(config.rope_theta)) bad("rope_theta");
   if (!(config.rms_eps > 0.f) || !std::isfinite(config.rms_eps)) bad("rms_eps");
   if (config.activation == TransformerActivation::SwiGLU && config.d_ff > INT_MAX / 2) bad("d_ff");
+  if (config.type_vocab_size < 0) bad("type_vocab_size");
 }
 
 }  // namespace nn

@@ -223,6 +223,7 @@ Network build_transformer_network(Context& ctx, const TransformerConfig& config,
     spec.qk_norm = config.qk_norm;
     spec.rope_theta = config.rope_theta;
     spec.rms_eps = config.rms_eps;
+    spec.causal = config.causal;
     auto block = std::make_unique<TransformerBlock>(ctx, spec, rng);
     block->set_name(index_name("blocks", static_cast<size_t>(i)));
     layers.push_back(std::move(block));

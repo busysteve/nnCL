@@ -26,6 +26,7 @@ struct TransformerBlockSpec {
   bool qk_norm = false;
   float rope_theta = 10000.f;
   float rms_eps = 1e-5f;
+  bool causal = true;
 };
 
 class TransformerBlock : public Layer {

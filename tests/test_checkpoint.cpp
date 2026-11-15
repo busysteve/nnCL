@@ -934,6 +934,60 @@ int test_checkpoint() {
     CHECK(resumed.step == 1);
     compare_facade_adamw(model, resumed.model, optimizer, *resumed.adamw);
   }
+  {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 2;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = true;
+    config.activation = nn::TransformerActivation::Gelu;
+    config.positional = nn::PositionalEncoding::LearnedAbsolute;
+    config.causal = false;
+    config.type_vocab_size = 2;
+    nn::Transformer model(ctx, config, 7);
+    bool saw_type = false;
+    for (const nn::NamedParam& param : model.parameters()) {
+      if (param.name == "type_emb.weight") {
+        saw_type = true;
+        CHECK((param.value->shape() == std::vector<int>{2, 8}));
+      }
+    }
+    CHECK(saw_type);
+    const std::filesystem::path path = dir / "facade-bert.bin";
+    model.save(path, nullptr);
+    CHECK(read_u32(read_bytes(path), 4) == 5);
+    nn::IndexTensor tokens(ctx, {1, 3});
+    const std::vector<int64_t> ids = {1, 0, 2};
+    tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+    nn::IndexTensor types(ctx, {1, 3});
+    const std::vector<int64_t> segs = {0, 1, 1};
+    types.copy_from_host(segs.data(), static_cast<int64_t>(segs.size()));
+    const std::vector<float> logits = model.forward(tokens, types).to_host();
+    nn::Transformer::Loaded loaded = nn::Transformer::load(ctx, path, nn::LoadMode::Inference);
+    const nn::TransformerConfig& restored =
+        std::get<nn::TransformerConfig>(loaded.model.network().config());
+    CHECK(restored.causal == false);
+    CHECK(restored.type_vocab_size == 2);
+    CHECK(restored.activation == nn::TransformerActivation::Gelu);
+    expect_bits(loaded.model.forward(tokens, types).to_host(), logits, "bert logits");
+    bool decode_threw = false;
+    try {
+      nn::Transformer::GenerateState state;
+      model.reset_generate_state(state, 1, 4);
+      nn::IndexTensor one(ctx, {1, 1});
+      const std::vector<int64_t> next = {1};
+      one.copy_from_host(next.data(), 1);
+      model.eval();
+      (void)model.decode_step(one, state);
+    } catch (const std::invalid_argument& error) {
+      decode_threw = std::string(error.what()) == "causal";
+    }
+    CHECK(decode_threw);
+  }
 
   std::printf("ckpt ok\n");
   return 0;

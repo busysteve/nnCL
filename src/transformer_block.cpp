@@ -61,7 +61,7 @@ TransformerBlock::TransformerBlock(Context& ctx, const TransformerBlockSpec& spe
   } else {
     ln1_ = std::make_unique<LayerNorm>(ctx, spec.d_model);
   }
-  mha_ = std::make_unique<MultiHeadAttention>(ctx, spec.d_model, spec.num_heads, true, spec.bias,
+  mha_ = std::make_unique<MultiHeadAttention>(ctx, spec.d_model, spec.num_heads, spec.causal, spec.bias,
                                               spec.use_rope, rng, spec.head_dim, spec.num_kv_heads,
                                               spec.qk_norm, spec.rope_theta, spec.rms_eps);
   drop1_ = std::make_unique<Dropout>(ctx, spec.dropout);

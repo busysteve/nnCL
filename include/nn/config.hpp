@@ -86,6 +86,8 @@ struct TransformerConfig {
   bool qk_norm = false;      // RMSNorm on Q and K, width head_dim, before RoPE
   float rope_theta = 10000.f;
   float rms_eps = 1e-5f;
+  bool causal = true;        // false is bidirectional attention, as in BERT
+  int type_vocab_size = 0;   // 0 omits the segment table. BERT uses 2.
 };
 
 int conv_out_size(int in, int kernel, int stride, int pad);
