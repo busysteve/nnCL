@@ -4,7 +4,7 @@ This is the contract of the C++ API in namespace `nn`. Two libraries implement i
 
 | Library | Tree | Backend |
 |---|---|---|
-| `nn` | [busysteve/nn](https://github.com/busysteve/nn) | CUDA, cuBLAS, cuDNN |
+| `nn` | [busysteve/nnCUDA](https://github.com/busysteve/nnCUDA) | CUDA, cuBLAS, cuDNN |
 | `nnCL` | [busysteve/nnCL](https://github.com/busysteve/nnCL) | OpenCL |
 
 The public headers under `include/nn/` are the same in both trees. The only header that differs is `nn/context.hpp`, and the difference is comments. A checkpoint written by one library loads in the other. `src/checkpoint.cpp` is the same file in both trees.

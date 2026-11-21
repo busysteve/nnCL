@@ -1,6 +1,6 @@
 # nnCL
 
-OpenCL implementation of the [busysteve/nn](https://github.com/busysteve/nn) neural-net API. The static library target is still named `nn`, and the public headers live in `nn/`. The shared contract is [docs/api.md](docs/api.md). [busysteve/llm](https://github.com/busysteve/llm) links against it by pointing `NN_SOURCE` at this tree.
+OpenCL implementation of the [busysteve/nnCUDA](https://github.com/busysteve/nnCUDA) neural-net API. The static library target is still named `nn`, and the public headers live in `nn/`. The shared contract is [docs/api.md](docs/api.md). [busysteve/llm](https://github.com/busysteve/llm) links against it by pointing `NN_SOURCE` at this tree.
 
 Dense float32, ranks 1–4, NCHW convolutions. One in-order command queue per `nn::Context`. A device is used only when its max work-group size is at least 256, because the kernels launch 256-wide groups. Do not set `RUSTICL_ENABLE`; on this machine `RUSTICL_ENABLE=all` hides the GPU.
 
