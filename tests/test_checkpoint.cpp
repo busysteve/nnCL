@@ -230,6 +230,7 @@ void round_trip(nn::Network net, nn::Context& ctx_a, const std::filesystem::path
   net.save(path, &optimizer);
 
   nn::Context ctx_b;
+  ctx_b.set_activation_dtype(nn::DType::Float32);
   nn::Network::Loaded loaded = nn::Network::load(ctx_b, path, nn::LoadMode::Resume);
   CHECK(loaded.optimizer.has_value());
   CHECK(!loaded.adamw.has_value());
@@ -336,6 +337,7 @@ int test_checkpoint() {
   const std::filesystem::path dir = std::filesystem::temp_directory_path() / "nn-ckpt";
   std::filesystem::create_directories(dir);
   nn::Context ctx;
+  ctx.set_activation_dtype(nn::DType::Float32);
   std::mt19937 rng(1);
 
   {
@@ -419,6 +421,7 @@ int test_checkpoint() {
     net.save(path, &optimizer);
 
     nn::Context ctx_b;
+    ctx_b.set_activation_dtype(nn::DType::Float32);
     nn::Network::Loaded resumed = nn::Network::load(ctx_b, path, nn::LoadMode::Resume);
     CHECK(resumed.optimizer.has_value());
     CHECK(resumed.network.family() == nn::Family::Transformer);
@@ -475,6 +478,7 @@ int test_checkpoint() {
                  "checkpoint tensor mismatch: count");
 
     nn::Context ctx_b;
+    ctx_b.set_activation_dtype(nn::DType::Float32);
     nn::Transformer::Loaded resumed = nn::Transformer::load(ctx_b, path, nn::LoadMode::Resume);
     CHECK(resumed.optimizer.has_value());
     CHECK(!resumed.adamw.has_value());
@@ -665,6 +669,7 @@ int test_checkpoint() {
     CHECK(read_u32(saved, optimizer_offset(saved)) == 2);
 
     nn::Context ctx_b;
+    ctx_b.set_activation_dtype(nn::DType::Float32);
     nn::Network::Loaded loaded = nn::Network::load(ctx_b, path, nn::LoadMode::Resume);
     CHECK(loaded.adamw.has_value());
     CHECK(!loaded.optimizer.has_value());
@@ -813,6 +818,7 @@ int test_checkpoint() {
     CHECK(read_u32(saved, 24) == 1);
 
     nn::Context ctx_b;
+    ctx_b.set_activation_dtype(nn::DType::Float32);
     nn::Transformer::Loaded resumed = nn::Transformer::load(ctx_b, path, nn::LoadMode::Resume);
     CHECK(resumed.adamw.has_value());
     CHECK(!resumed.optimizer.has_value());
@@ -929,6 +935,7 @@ int test_checkpoint() {
     model.save(adamw_path, &optimizer);
     CHECK(read_u32(read_bytes(adamw_path), 4) == 4);
     nn::Context ctx_b;
+    ctx_b.set_activation_dtype(nn::DType::Float32);
     nn::Transformer::Loaded resumed = nn::Transformer::load(ctx_b, adamw_path, nn::LoadMode::Resume);
     CHECK(resumed.adamw.has_value());
     CHECK(resumed.step == 1);

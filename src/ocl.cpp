@@ -1,5 +1,6 @@
 #include "ocl.hpp"
 
+#include "activate.hpp"
 #include "nn/error.hpp"
 
 #include <cctype>
@@ -384,6 +385,12 @@ void Context::Impl::open(int index) {
 
 Context::Impl::~Impl() {
   if (queue) clFinish(queue);
+  for (const ArenaBlock& block : f32_arena) {
+    if (block.ptr) clReleaseMemObject(static_cast<cl_mem>(block.ptr));
+  }
+  for (const ArenaBlock& block : bf16_arena) {
+    if (block.ptr) clReleaseMemObject(static_cast<cl_mem>(block.ptr));
+  }
   for (auto& entry : kernels) {
     if (entry.second) clReleaseKernel(entry.second);
   }
@@ -874,6 +881,18 @@ void launch_write_kv(Context& ctx, float* dst, const float* src, int t, int t_ma
       .over(n, 256);
 }
 
+void launch_write_kv_u16(Context& ctx, uint16_t* dst, const uint16_t* src, int t, int t_max, int dh,
+                         int64_t n) {
+  KernelCall(ctx, "write_kv_u16")
+      .mem(mem_of(dst))
+      .mem(mem_of(src))
+      .i(t)
+      .i(t_max)
+      .i(dh)
+      .l(static_cast<cl_long>(n))
+      .over(n, 256);
+}
+
 void launch_softmax_rows(Context& ctx, float* out, const float* in, int rows, int cols) {
   KernelCall call(ctx, "softmax_rows");
   call.mem(mem_of(out)).mem(mem_of(in)).i(cols).local(256 * sizeof(float));
@@ -1116,6 +1135,152 @@ void launch_batch_norm_backward(Context& ctx, float* dx, const float* dy, const 
       .i(W)
       .local(256 * sizeof(float));
   call.groups(C, 256);
+}
+
+namespace {
+
+cl_mem as_mem(const void* ptr) { return reinterpret_cast<cl_mem>(const_cast<void*>(ptr)); }
+
+void* bump(Context& ctx, std::vector<ArenaBlock>& blocks, size_t bytes) {
+  // cl_mem is a handle, not a device address, so each bump is its own buffer.
+  const size_t need = bytes == 0 ? 0 : (bytes + 255) & ~size_t{255};
+  if (need == 0) return nullptr;
+  for (ArenaBlock& block : blocks) {
+    if (block.used == 0 && block.bytes >= need) {
+      block.used = block.bytes;
+      return block.ptr;
+    }
+  }
+  size_t cap = 1u << 20;
+  if (!blocks.empty() && blocks.back().bytes > cap) cap = blocks.back().bytes * 2;
+  if (cap < need) cap = need;
+  ArenaBlock block;
+  block.ptr = alloc_mem(ctx, cap);
+  block.bytes = cap;
+  block.used = cap;
+  void* ptr = block.ptr;
+  blocks.push_back(block);
+  return ptr;
+}
+
+void enqueue_bf16_gemm(Context& ctx, const char* name, void* C, const uint16_t* A, const uint16_t* B, int M,
+                       int N, int K, int batches, int ldc, int lda, int ldb, int64_t stride_c,
+                       int64_t stride_a, int64_t stride_b, float alpha, float beta) {
+  if (M <= 0 || N <= 0 || batches <= 0) return;
+  const auto& impl = ContextAccess::get(ctx);
+  KernelCall call(ctx, name);
+  call.mem(as_mem(C))
+      .mem(as_mem(A))
+      .mem(as_mem(B))
+      .i(M)
+      .i(N)
+      .i(K)
+      .i(batches)
+      .i(ldc)
+      .i(lda)
+      .i(ldb)
+      .l(static_cast<cl_long>(stride_c))
+      .l(static_cast<cl_long>(stride_a))
+      .l(static_cast<cl_long>(stride_b))
+      .f(alpha)
+      .f(beta);
+  const size_t local[3] = {impl.gemm_lx, impl.gemm_ly, 1};
+  const size_t global[3] = {round_up(static_cast<size_t>(N), local[0]),
+                            round_up(static_cast<size_t>(M), local[1]),
+                            static_cast<size_t>(batches)};
+  call.nd(global, local, 3);
+}
+
+}  // namespace
+
+void arena_reset(Context& ctx) {
+  for (ArenaBlock& block : ContextAccess::get(ctx).f32_arena) block.used = 0;
+  for (ArenaBlock& block : ContextAccess::get(ctx).bf16_arena) block.used = 0;
+}
+
+float* arena_f32(Context& ctx, int64_t n) {
+  if (n <= 0) return nullptr;
+  return static_cast<float*>(bump(ctx, ContextAccess::get(ctx).f32_arena, static_cast<size_t>(n) * sizeof(float)));
+}
+
+void zero_f32(Context& ctx, float* dst, int64_t n) {
+  if (n <= 0 || dst == nullptr) return;
+  fill_mem_f(ctx, mem_of(dst), 0.f, static_cast<size_t>(n));
+}
+
+uint16_t* arena_bf16(Context& ctx, int64_t n) {
+  if (n <= 0) return nullptr;
+  return static_cast<uint16_t*>(
+      bump(ctx, ContextAccess::get(ctx).bf16_arena, static_cast<size_t>(n) * sizeof(uint16_t)));
+}
+
+void cast_f32_to_bf16(Context& ctx, uint16_t* dst, const float* src, int64_t n) {
+  if (n <= 0) return;
+  KernelCall(ctx, "cast_f32_to_bf16").mem(as_mem(dst)).mem(mem_of(src)).l(static_cast<cl_long>(n)).over(n, 256);
+}
+
+void cast_bf16_to_f32(Context& ctx, float* dst, const uint16_t* src, int64_t n) {
+  if (n <= 0) return;
+  KernelCall(ctx, "cast_bf16_to_f32").mem(mem_of(dst)).mem(as_mem(src)).l(static_cast<cl_long>(n)).over(n, 256);
+}
+
+void load_f32(Context& ctx, float* dst, const Tensor& src) {
+  if (src.dtype() == DType::Float32) {
+    copy_mem(ctx, mem_of(dst), mem_of(src.data()), static_cast<size_t>(src.numel()) * sizeof(float));
+    return;
+  }
+  cast_bf16_to_f32(ctx, dst, src.bf16_data(), src.numel());
+}
+
+void store_tensor(Context& ctx, Tensor& dst, const float* src) {
+  if (dst.dtype() == DType::Float32) {
+    copy_mem(ctx, mem_of(dst.data()), mem_of(src), static_cast<size_t>(dst.numel()) * sizeof(float));
+    return;
+  }
+  cast_f32_to_bf16(ctx, dst.bf16_data(), src, dst.numel());
+}
+
+void gemm_nt_bf16(Context& ctx, void* C, bool c_bf16, const uint16_t* A, const uint16_t* B, int M, int N,
+                  int K, int batches, int ldc, int lda, int ldb, int64_t stride_c, int64_t stride_a,
+                  int64_t stride_b, float alpha, float beta) {
+  enqueue_bf16_gemm(ctx, c_bf16 ? "gemm_nt_bf16" : "gemm_nt_bf16_f32", C, A, B, M, N, K, batches, ldc, lda,
+                    ldb, stride_c, stride_a, stride_b, alpha, beta);
+}
+
+void gemm_nn_bf16(Context& ctx, void* C, bool c_bf16, const uint16_t* A, const uint16_t* B, int M, int N,
+                  int K, int batches, int ldc, int lda, int ldb, int64_t stride_c, int64_t stride_a,
+                  int64_t stride_b, float alpha, float beta) {
+  enqueue_bf16_gemm(ctx, c_bf16 ? "gemm_nn_bf16" : "gemm_nn_bf16_f32", C, A, B, M, N, K, batches, ldc, lda,
+                    ldb, stride_c, stride_a, stride_b, alpha, beta);
+}
+
+void gemm_tn_bf16(Context& ctx, void* C, bool c_bf16, const uint16_t* A, const uint16_t* B, int M, int N,
+                  int K, int batches, int ldc, int lda, int ldb, int64_t stride_c, int64_t stride_a,
+                  int64_t stride_b, float alpha, float beta) {
+  enqueue_bf16_gemm(ctx, c_bf16 ? "gemm_tn_bf16" : "gemm_tn_bf16_f32", C, A, B, M, N, K, batches, ldc, lda,
+                    ldb, stride_c, stride_a, stride_b, alpha, beta);
+}
+
+void launch_add_bias_bf16(Context& ctx, uint16_t* y, const float* bias, int rows, int cols) {
+  const int64_t n = static_cast<int64_t>(rows) * cols;
+  if (n <= 0) return;
+  KernelCall(ctx, "add_bias_bf16")
+      .mem(as_mem(y))
+      .mem(mem_of(bias))
+      .i(rows)
+      .i(cols)
+      .over(n, 256);
+}
+
+void launch_bias_grad_bf16(Context& ctx, const uint16_t* grad_y, float* grad_bias, int rows, int cols) {
+  if (cols <= 0) return;
+  KernelCall(ctx, "bias_grad_bf16")
+      .mem(as_mem(grad_y))
+      .mem(mem_of(grad_bias))
+      .i(rows)
+      .i(cols)
+      .local(256 * sizeof(float))
+      .groups(cols, 256);
 }
 
 }  // namespace nn

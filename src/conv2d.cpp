@@ -1,5 +1,6 @@
 #include "nn/layers/conv2d.hpp"
 
+#include "activate.hpp"
 #include "ensure.hpp"
 #include "nn/config.hpp"
 #include "nn/error.hpp"
@@ -53,8 +54,8 @@ void Conv2d::zero_grad() {
 void Conv2d::prepare(int n, int h, int w) {
   const int ho = conv_out_size(h, kernel_, stride_, pad_);
   const int wo = conv_out_size(w, kernel_, stride_, pad_);
-  ensure_tensor(output_, *ctx_, {n, out_channels_, ho, wo});
-  ensure_tensor(grad_input_, *ctx_, {n, in_channels_, h, w});
+  ensure_activation(output_, *ctx_, {n, out_channels_, ho, wo});
+  ensure_activation(grad_input_, *ctx_, {n, in_channels_, h, w});
 }
 
 const Tensor& Conv2d::forward(const Tensor& input) {
@@ -63,13 +64,24 @@ const Tensor& Conv2d::forward(const Tensor& input) {
   const int h = input.shape()[2];
   const int w = input.shape()[3];
   prepare(n, h, w);
-  ensure_tensor(cache_x_, *ctx_, input.shape());
-  cache_x_->copy_from(input);
+  ensure_activation(cache_x_, *ctx_, input.shape());
   const float* bias = use_bias_ ? bias_->data() : nullptr;
   const int has_bias = use_bias_ ? 1 : 0;
+  const int ho = output_->shape()[2];
+  const int wo = output_->shape()[3];
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, input);
+    float* y = arena_f32(*ctx_, output_->numel());
+    launch_conv2d_forward(*ctx_, y, x, weight_.data(), bias, has_bias, n, in_channels_,
+                          out_channels_, h, w, kernel_, ho, wo, stride_, pad_);
+    keep_f32(*ctx_, *cache_x_, x);
+    keep_f32(*ctx_, *output_, y);
+    return *output_;
+  }
+  cache_x_->copy_from(input);
   launch_conv2d_forward(*ctx_, output_->data(), input.data(), weight_.data(), bias, has_bias, n,
-                        in_channels_, out_channels_, h, w, kernel_, output_->shape()[2],
-                        output_->shape()[3], stride_, pad_);
+                        in_channels_, out_channels_, h, w, kernel_, ho, wo, stride_, pad_);
   return *output_;
 }
 
@@ -82,6 +94,21 @@ const Tensor& Conv2d::backward(const Tensor& grad_output) {
   const int w = cache_x_->shape()[3];
   const int ho = output_->shape()[2];
   const int wo = output_->shape()[3];
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    float* x = stage_f32(*ctx_, *cache_x_);
+    float* dx = arena_f32(*ctx_, grad_input_->numel());
+    launch_conv2d_backward_data(*ctx_, dx, dy, weight_.data(), n, in_channels_, out_channels_, h, w,
+                                kernel_, ho, wo, stride_, pad_);
+    launch_conv2d_backward_filter(*ctx_, grad_weight_.data(), x, dy, n, in_channels_, out_channels_,
+                                  h, w, kernel_, ho, wo, stride_, pad_);
+    if (grad_bias_) {
+      launch_conv_bias_grad(*ctx_, dy, grad_bias_->data(), n, out_channels_, ho, wo);
+    }
+    keep_f32(*ctx_, *grad_input_, dx);
+    return *grad_input_;
+  }
   launch_conv2d_backward_data(*ctx_, grad_input_->data(), grad_output.data(), weight_.data(), n,
                               in_channels_, out_channels_, h, w, kernel_, ho, wo, stride_, pad_);
   launch_conv2d_backward_filter(*ctx_, grad_weight_.data(), cache_x_->data(), grad_output.data(), n,

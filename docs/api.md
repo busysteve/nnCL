@@ -25,7 +25,7 @@ Create one `Context`. Pass that same `Context&` to every tensor, index buffer, l
 
 Weight and bias gradients accumulate. Call `zero_grad` once per step. `zero_grad` does not change parameter values, optimizer state, or batch-norm buffers. A new network is in train mode. Call `eval()` before inference when the network contains batch-norm or dropout.
 
-Storage is dense float32. Index buffers are dense `int64`. Layout:
+Parameters, the gradients Adam sees, optimizer state, and checkpoints are dense float32. Retained activations (layer outputs and caches, attention scores, and the KV cache) are bfloat16 unless `set_activation_dtype(Float32)` selects float32. A matmul reads bfloat16 operands and accumulates float32. Softmax, layer-norm, and RMSNorm compute in float32. `to_host()` widens bfloat16 to float. `data()` on a bfloat16 tensor throws `tensor dtype`. Index buffers are dense `int64`. Layout:
 
 | Rank | Shape | Order |
 |---|---|---|
@@ -67,12 +67,16 @@ class Context {
   explicit Context(int device);
   explicit Context(const std::string& choice);
   void synchronize() const;
+  void set_activation_dtype(DType dtype);
+  DType activation_dtype() const;
 };
 ```
 
 `device_count()` is the length of the list below. `device_name(int)` is that entry's name. An index outside `0 .. device_count()-1` throws `nn::Error` with message `device`. `detect_devices()` returns the same list in index order. `select_device("auto")` returns the first entry. Any other choice is a decimal index into that list, after leading and trailing whitespace is removed. `auto` is matched case-insensitively. A blank choice, a word other than `auto`, an index past the list, or an empty list throws `device`.
 
 `synchronize()` waits until work queued on that context has finished.
+
+`set_activation_dtype` accepts `Float32` or `BFloat16` and throws `dtype` otherwise. The default is `BFloat16`. It selects the storage of retained activations. Parameters, Adam state, and checkpoints stay float32. Call it before creating tensors or layers.
 
 `to_host`, `kaiming_normal`, and `normal_` synchronize for you. `copy_from_host` queues the upload. Call `synchronize()` before reusing or freeing the host buffer.
 
@@ -97,12 +101,16 @@ Header: `nn/tensor.hpp`
 class Tensor {
  public:
   Tensor(Context& ctx, std::vector<int> shape);
+  Tensor(Context& ctx, std::vector<int> shape, DType dtype);
   Context& context() const;
   int rank() const;
   const std::vector<int>& shape() const;
   int64_t numel() const;
+  DType dtype() const;
   float* data();
   const float* data() const;
+  uint16_t* bf16_data();
+  const uint16_t* bf16_data() const;
   void zero();
   void fill(float value);
   void scale(float factor);
@@ -114,7 +122,7 @@ class Tensor {
 };
 ```
 
-The constructor allocates device memory. Fresh memory is uninitialized. Call `zero`, `fill`, or `copy_from_host` before a read.
+The constructor allocates device memory. `Tensor(ctx, shape)` is float32. Fresh memory is uninitialized. Call `zero`, `fill`, or `copy_from_host` before a read. `data()` is the float32 pointer and throws `tensor dtype` when the tensor is bfloat16. `bf16_data()` is the bfloat16 pointer and throws `tensor dtype` when the tensor is float32. `to_host()` returns float and widens bfloat16. `copy_from` converts when the dtypes differ. `reshape` keeps the dtype.
 
 | Condition | Exception | Message |
 |---|---|---|
@@ -124,6 +132,7 @@ The constructor allocates device memory. Fresh memory is uninitialized. Call `ze
 | `copy_from` element counts differ | `nn::Error` | `tensor copy numel mismatch` |
 | `copy_from_host` count differs from `numel()` | `nn::Error` | `tensor host copy numel mismatch` |
 | `reshape` element counts differ | `nn::Error` | `tensor reshape numel mismatch` |
+| `data()` on bfloat16, or `bf16_data()` on float32 | `nn::Error` | `tensor dtype` |
 
 `copy_from` requires the same element count. The source is complete before the destination write is queued. On CUDA, a source on another context is synchronized and the copy is `cudaMemcpyAsync` on the destination stream. On OpenCL, a source on another context is read with `to_host` and then uploaded. `scale` multiplies every element in place on the context queue and does not synchronize. `to_host` synchronizes, then returns a `std::vector<float>`. `reshape` allocates a new tensor on the same context and copies. The destructor synchronizes the queue and frees the device memory.
 
@@ -1145,7 +1154,7 @@ The loader runs `validate` on the rebuilt config.
 
 Parameter section: count as `uint32`, a zero `uint32`, then one record per parameter in `parameters()` order.
 
-Each parameter record: name string, shape, dtype `uint32` equal to 1 (float32), `numel` as `uint32`, that many floats, pad to 8. The product of the shape must equal `numel`. A dtype other than 1, or a product mismatch, throws `checkpoint tensor mismatch: ` plus the name.
+Each parameter record: name string, shape, dtype `uint32` equal to 1 (float32), `numel` as `uint32`, that many floats, pad to 8. The product of the shape must equal `numel`. A dtype other than 1, or a product mismatch, throws `checkpoint tensor mismatch: ` plus the name. Activations are not stored in the file.
 
 Batch-norm section: count as `uint32`, a zero `uint32`, then one record per pair. The live buffers must be ordered `running_mean`, `running_var`, repeating. The prefixes of each pair must match.
 

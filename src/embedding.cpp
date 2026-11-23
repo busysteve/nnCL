@@ -1,5 +1,6 @@
 #include "nn/layers/embedding.hpp"
 
+#include "activate.hpp"
 #include "ensure.hpp"
 #include "nn/error.hpp"
 #include "nn/init.hpp"
@@ -51,8 +52,15 @@ const Tensor& Embedding::forward_indices(const IndexTensor& indices) {
 
   std::vector<int> out_shape = indices.shape();
   out_shape.push_back(embedding_dim_);
-  ensure_tensor(output_, *ctx_, out_shape);
+  ensure_activation(output_, *ctx_, out_shape);
   const int64_t rows = cache_indices_->numel();
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* y = arena_f32(*ctx_, output_->numel());
+    launch_embedding_gather(*ctx_, y, weight_.data(), cache_indices_->data(), rows, embedding_dim_);
+    keep_f32(*ctx_, *output_, y);
+    return *output_;
+  }
   launch_embedding_gather(*ctx_, output_->data(), weight_.data(), cache_indices_->data(), rows,
                           embedding_dim_);
   return *output_;
@@ -62,10 +70,17 @@ const Tensor& Embedding::backward(const Tensor& grad_output) {
   if (!cache_indices_ || !output_) throw Error("Embedding backward without forward");
   if (grad_output.shape() != output_->shape()) throw Error("Embedding backward shape");
   const int64_t rows = cache_indices_->numel();
-  launch_embedding_scatter(*ctx_, grad_weight_.data(), grad_output.data(), cache_indices_->data(),
-                           rows, embedding_dim_);
+  if (grad_output.dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    launch_embedding_scatter(*ctx_, grad_weight_.data(), dy, cache_indices_->data(), rows,
+                             embedding_dim_);
+  } else {
+    launch_embedding_scatter(*ctx_, grad_weight_.data(), grad_output.data(), cache_indices_->data(),
+                             rows, embedding_dim_);
+  }
   // Ids are discrete. Own a zero tensor so the returned reference follows the layer rule.
-  ensure_tensor(grad_input_, *ctx_, grad_output.shape());
+  ensure_activation(grad_input_, *ctx_, grad_output.shape());
   grad_input_->zero();
   return *grad_input_;
 }

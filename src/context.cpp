@@ -73,6 +73,13 @@ Context::Context(const std::string& choice) : impl_(std::make_unique<Impl>()) {
 
 Context::~Context() = default;
 
+void Context::set_activation_dtype(DType dtype) {
+  if (dtype != DType::Float32 && dtype != DType::BFloat16) throw Error("dtype");
+  impl_->activation = dtype;
+}
+
+DType Context::activation_dtype() const { return impl_->activation; }
+
 void Context::synchronize() const {
   check_cl(clFinish(impl_->queue), "clFinish");
 }

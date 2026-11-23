@@ -1,5 +1,7 @@
 #pragma once
 
+#include "nn/dtype.hpp"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,6 +36,11 @@ class Context {
   Context& operator=(Context&&) = delete;
 
   void synchronize() const;
+
+  // Retained activations use this dtype. Parameters, gradients Adam sees, and
+  // checkpoints stay Float32. The default is BFloat16.
+  void set_activation_dtype(DType dtype);
+  DType activation_dtype() const;
 
  private:
   struct Impl;

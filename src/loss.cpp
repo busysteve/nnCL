@@ -1,5 +1,6 @@
 #include "nn/loss.hpp"
 
+#include "activate.hpp"
 #include "nn/error.hpp"
 #include "ocl.hpp"
 
@@ -71,8 +72,15 @@ LossResult softmax_cross_entropy(Context& ctx, const Tensor& logits, const Devic
   per_sample.raw = alloc_mem(ctx, static_cast<size_t>(n) * sizeof(float));
   bad.raw = alloc_mem(ctx, sizeof(int));
   fill_mem_i(ctx, bad.raw, 0, 1);
-  launch_softmax_ce(ctx, logits.data(), labels.data(), result.grad_logits.data(),
-                    as_float(per_sample.raw), n, classes, as_i32(bad.raw));
+  const float* logits_f = nullptr;
+  if (logits.dtype() == DType::BFloat16) {
+    arena_reset(ctx);
+    logits_f = stage_f32(ctx, logits);
+  } else {
+    logits_f = logits.data();
+  }
+  launch_softmax_ce(ctx, logits_f, labels.data(), result.grad_logits.data(), as_float(per_sample.raw),
+                    n, classes, as_i32(bad.raw));
   const float sum = launch_reduce_sum(ctx, as_float(per_sample.raw), n);
   int bad_host = 0;
   read_mem(ctx, bad.raw, &bad_host, sizeof(bad_host));
@@ -123,8 +131,15 @@ LossResult sequence_cross_entropy(Context& ctx, const Tensor& logits, const Inde
 
   Mem per_sample;
   per_sample.raw = alloc_mem(ctx, static_cast<size_t>(rows) * sizeof(float));
-  launch_sequence_ce(ctx, logits.data(), labels.data(), result.grad_logits.data(),
-                     as_float(per_sample.raw), rows, classes, ignore_index, n_valid, as_i32(bad.raw));
+  const float* logits_f = nullptr;
+  if (logits.dtype() == DType::BFloat16) {
+    arena_reset(ctx);
+    logits_f = stage_f32(ctx, logits);
+  } else {
+    logits_f = logits.data();
+  }
+  launch_sequence_ce(ctx, logits_f, labels.data(), result.grad_logits.data(), as_float(per_sample.raw),
+                     rows, classes, ignore_index, n_valid, as_i32(bad.raw));
   const float sum = launch_reduce_sum(ctx, as_float(per_sample.raw), rows);
   read_mem(ctx, bad.raw, &bad_host, sizeof(bad_host));
   if (bad_host) throw Error("label out of range");

@@ -1,5 +1,6 @@
 #include "nn/layers/batch_norm2d.hpp"
 
+#include "activate.hpp"
 #include "ensure.hpp"
 #include "nn/error.hpp"
 #include "ocl.hpp"
@@ -53,18 +54,39 @@ void BatchNorm2d::set_training(bool training) { training_ = training; }
 
 void BatchNorm2d::bind(const Tensor& input) {
   if (input.rank() != 4 || input.shape()[1] != channels_) throw Error("BatchNorm2d input shape");
-  ensure_tensor(output_, *ctx_, input.shape());
-  ensure_tensor(grad_input_, *ctx_, input.shape());
+  ensure_activation(output_, *ctx_, input.shape());
+  ensure_activation(grad_input_, *ctx_, input.shape());
 }
 
 const Tensor& BatchNorm2d::forward(const Tensor& input) {
   bind(input);
-  ensure_tensor(cache_x_, *ctx_, input.shape());
-  cache_x_->copy_from(input);
+  ensure_activation(cache_x_, *ctx_, input.shape());
   const float eps = 1e-5f;
   const int n = input.shape()[0];
   const int h = input.shape()[2];
   const int w = input.shape()[3];
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, input);
+    float* y = arena_f32(*ctx_, output_->numel());
+    if (training_) {
+      const int64_t count =
+          static_cast<int64_t>(input.shape()[0]) * input.shape()[2] * input.shape()[3];
+      if (count <= 1) throw Error("BatchNorm train mode needs more than one value per channel");
+      ++batches_;
+      const float factor = static_cast<float>(1.0 / static_cast<double>(batches_));
+      launch_batch_norm_train(*ctx_, y, x, weight_.data(), bias_.data(), running_mean_.data(),
+                              running_var_.data(), saved_mean_.data(), saved_inv_variance_.data(), n,
+                              channels_, h, w, eps, factor);
+    } else {
+      launch_batch_norm_eval(*ctx_, y, x, weight_.data(), bias_.data(), running_mean_.data(),
+                             running_var_.data(), n, channels_, h, w, eps);
+    }
+    keep_f32(*ctx_, *cache_x_, x);
+    keep_f32(*ctx_, *output_, y);
+    return *output_;
+  }
+  cache_x_->copy_from(input);
   if (training_) {
     const int64_t count =
         static_cast<int64_t>(input.shape()[0]) * input.shape()[2] * input.shape()[3];
@@ -87,6 +109,17 @@ const Tensor& BatchNorm2d::backward(const Tensor& grad_output) {
   const int n = cache_x_->shape()[0];
   const int h = cache_x_->shape()[2];
   const int w = cache_x_->shape()[3];
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    float* x = stage_f32(*ctx_, *cache_x_);
+    float* dx = arena_f32(*ctx_, grad_input_->numel());
+    launch_batch_norm_backward(*ctx_, dx, dy, x, weight_.data(), saved_mean_.data(),
+                               saved_inv_variance_.data(), grad_weight_.data(), grad_bias_.data(), n,
+                               channels_, h, w);
+    keep_f32(*ctx_, *grad_input_, dx);
+    return *grad_input_;
+  }
   launch_batch_norm_backward(*ctx_, grad_input_->data(), grad_output.data(), cache_x_->data(),
                              weight_.data(), saved_mean_.data(), saved_inv_variance_.data(),
                              grad_weight_.data(), grad_bias_.data(), n, channels_, h, w);

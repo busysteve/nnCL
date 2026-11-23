@@ -22,8 +22,15 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace nn {
+
+struct ArenaBlock {
+  void* ptr = nullptr;
+  size_t bytes = 0;
+  size_t used = 0;
+};
 
 struct Context::Impl {
   cl_context context = nullptr;
@@ -35,6 +42,9 @@ struct Context::Impl {
   bool fp64 = false;
   size_t gemm_lx = 1;
   size_t gemm_ly = 1;
+  DType activation = DType::BFloat16;
+  std::vector<ArenaBlock> f32_arena;
+  std::vector<ArenaBlock> bf16_arena;
 
   void open(int index);
   ~Impl();
@@ -62,6 +72,9 @@ inline cl_mem mem_of(const int64_t* p) {
   return reinterpret_cast<cl_mem>(const_cast<int64_t*>(p));
 }
 inline cl_mem mem_of(const int* p) { return reinterpret_cast<cl_mem>(const_cast<int*>(p)); }
+inline cl_mem mem_of(const uint16_t* p) {
+  return reinterpret_cast<cl_mem>(const_cast<uint16_t*>(p));
+}
 inline float* as_float(cl_mem mem) { return reinterpret_cast<float*>(mem); }
 inline int64_t* as_i64(cl_mem mem) { return reinterpret_cast<int64_t*>(mem); }
 inline int* as_i32(cl_mem mem) { return reinterpret_cast<int*>(mem); }
@@ -140,6 +153,8 @@ void launch_sum_kv(Context& ctx, float* dst, const float* src, int time, int kv_
 void launch_causal_mask(Context& ctx, float* scores, int time, int64_t n);
 void launch_write_kv(Context& ctx, float* dst, const float* src, int t, int t_max, int dh,
                      int64_t n);
+void launch_write_kv_u16(Context& ctx, uint16_t* dst, const uint16_t* src, int t, int t_max, int dh,
+                         int64_t n);
 void launch_softmax_rows(Context& ctx, float* out, const float* in, int rows, int cols);
 void launch_softmax_backward(Context& ctx, float* ds, const float* probs, const float* dp, int rows,
                              int cols, int causal);

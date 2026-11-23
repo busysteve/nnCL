@@ -1,10 +1,12 @@
 #include "nn/tensor.hpp"
 
+#include "activate.hpp"
 #include "nn/error.hpp"
 #include "ocl.hpp"
 
 #include <climits>
 #include <utility>
+#include <vector>
 
 namespace nn {
 namespace {
@@ -22,20 +24,26 @@ int64_t checked_numel(const std::vector<int>& shape) {
 
 }  // namespace
 
-Tensor::Tensor(Context& ctx, std::vector<int> shape) : ctx_(&ctx), shape_(std::move(shape)) {
+Tensor::Tensor(Context& ctx, std::vector<int> shape) : Tensor(ctx, std::move(shape), DType::Float32) {}
+
+Tensor::Tensor(Context& ctx, std::vector<int> shape, DType dtype)
+    : ctx_(&ctx), shape_(std::move(shape)), dtype_(dtype) {
+  if (dtype_ != DType::Float32 && dtype_ != DType::BFloat16) throw Error("dtype");
   numel_ = checked_numel(shape_);
-  bytes_ = static_cast<size_t>(numel_) * sizeof(float);
-  data_ = as_float(alloc_mem(*ctx_, bytes_));
+  bytes_ = static_cast<size_t>(numel_) * static_cast<size_t>(dtype_size(dtype_));
+  storage_ = alloc_mem(*ctx_, bytes_);
 }
 
+void Tensor::allocate() {}
+
 void Tensor::release() noexcept {
-  if (!data_) return;
+  if (!storage_) return;
   if (ctx_) {
     cl_command_queue queue = ContextAccess::get(*ctx_).queue;
     if (queue) clFinish(queue);
   }
-  free_mem(mem_of(data_));
-  data_ = nullptr;
+  free_mem(static_cast<cl_mem>(storage_));
+  storage_ = nullptr;
   bytes_ = 0;
   numel_ = 0;
 }
@@ -46,11 +54,12 @@ Tensor::Tensor(Tensor&& other) noexcept
     : ctx_(other.ctx_),
       shape_(std::move(other.shape_)),
       numel_(other.numel_),
-      data_(other.data_),
+      dtype_(other.dtype_),
+      storage_(other.storage_),
       bytes_(other.bytes_) {
   other.ctx_ = nullptr;
   other.numel_ = 0;
-  other.data_ = nullptr;
+  other.storage_ = nullptr;
   other.bytes_ = 0;
 }
 
@@ -60,35 +69,103 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
   ctx_ = other.ctx_;
   shape_ = std::move(other.shape_);
   numel_ = other.numel_;
-  data_ = other.data_;
+  dtype_ = other.dtype_;
+  storage_ = other.storage_;
   bytes_ = other.bytes_;
   other.ctx_ = nullptr;
   other.numel_ = 0;
-  other.data_ = nullptr;
+  other.storage_ = nullptr;
   other.bytes_ = 0;
   return *this;
 }
 
-void Tensor::fill(float value) { fill_mem_f(*ctx_, mem_of(data_), value, static_cast<size_t>(numel_)); }
+float* Tensor::data() {
+  if (dtype_ != DType::Float32) throw Error("tensor dtype");
+  return static_cast<float*>(storage_);
+}
 
-void Tensor::zero() { fill(0.f); }
+const float* Tensor::data() const {
+  if (dtype_ != DType::Float32) throw Error("tensor dtype");
+  return static_cast<const float*>(storage_);
+}
 
-void Tensor::scale(float factor) { launch_scale(*ctx_, data_, numel_, factor); }
+uint16_t* Tensor::bf16_data() {
+  if (dtype_ != DType::BFloat16) throw Error("tensor dtype");
+  return static_cast<uint16_t*>(storage_);
+}
+
+const uint16_t* Tensor::bf16_data() const {
+  if (dtype_ != DType::BFloat16) throw Error("tensor dtype");
+  return static_cast<const uint16_t*>(storage_);
+}
+
+void Tensor::fill(float value) {
+  if (dtype_ == DType::Float32) {
+    fill_mem_f(*ctx_, static_cast<cl_mem>(storage_), value, static_cast<size_t>(numel_));
+    return;
+  }
+  if (value == 0.f) {
+    zero();
+    return;
+  }
+  std::vector<uint16_t> host(static_cast<size_t>(numel_), f32_to_bf16(value));
+  write_mem(*ctx_, static_cast<cl_mem>(storage_), host.data(), bytes_);
+  ctx_->synchronize();
+}
+
+void Tensor::zero() {
+  const uint16_t pattern = 0;
+  cl_command_queue queue = ContextAccess::get(*ctx_).queue;
+  check_cl(clEnqueueFillBuffer(queue, static_cast<cl_mem>(storage_), &pattern, sizeof(pattern), 0, bytes_,
+                               0, nullptr, nullptr),
+           "clEnqueueFillBuffer");
+}
+
+void Tensor::scale(float factor) {
+  if (dtype_ == DType::Float32) {
+    launch_scale(*ctx_, data(), numel_, factor);
+    return;
+  }
+  arena_reset(*ctx_);
+  float* tmp = arena_f32(*ctx_, numel_);
+  cast_bf16_to_f32(*ctx_, tmp, bf16_data(), numel_);
+  launch_scale(*ctx_, tmp, numel_, factor);
+  cast_f32_to_bf16(*ctx_, bf16_data(), tmp, numel_);
+}
 
 void Tensor::copy_from(const Tensor& src) {
   if (numel_ != src.numel_) throw Error("tensor copy numel mismatch");
-  if (src.data_ == data_) return;
+  if (storage_ == src.storage_) return;
   if (&src.context() != ctx_) {
     const std::vector<float> host = src.to_host();
     copy_from_host(host);
     return;
   }
-  copy_mem(*ctx_, mem_of(data_), mem_of(src.data_), bytes_);
+  if (dtype_ == src.dtype_) {
+    copy_mem(*ctx_, static_cast<cl_mem>(storage_), static_cast<cl_mem>(src.storage_), bytes_);
+    return;
+  }
+  if (dtype_ == DType::BFloat16 && src.dtype_ == DType::Float32) {
+    cast_f32_to_bf16(*ctx_, bf16_data(), src.data(), numel_);
+    return;
+  }
+  if (dtype_ == DType::Float32 && src.dtype_ == DType::BFloat16) {
+    cast_bf16_to_f32(*ctx_, data(), src.bf16_data(), numel_);
+    return;
+  }
+  throw Error("tensor dtype");
 }
 
 void Tensor::copy_from_host(const float* src, int64_t n) {
   if (n != numel_) throw Error("tensor host copy numel mismatch");
-  write_mem(*ctx_, mem_of(data_), src, bytes_);
+  if (dtype_ == DType::Float32) {
+    write_mem(*ctx_, static_cast<cl_mem>(storage_), src, bytes_);
+    return;
+  }
+  std::vector<uint16_t> host(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) host[static_cast<size_t>(i)] = f32_to_bf16(src[i]);
+  write_mem(*ctx_, static_cast<cl_mem>(storage_), host.data(), bytes_);
+  ctx_->synchronize();
 }
 
 void Tensor::copy_from_host(const std::vector<float>& src) {
@@ -97,14 +174,21 @@ void Tensor::copy_from_host(const std::vector<float>& src) {
 
 std::vector<float> Tensor::to_host() const {
   ctx_->synchronize();
-  std::vector<float> host(static_cast<size_t>(numel_));
-  read_mem(*ctx_, mem_of(data_), host.data(), bytes_);
+  if (dtype_ == DType::Float32) {
+    std::vector<float> host(static_cast<size_t>(numel_));
+    read_mem(*ctx_, static_cast<cl_mem>(storage_), host.data(), bytes_);
+    return host;
+  }
+  std::vector<uint16_t> bits(static_cast<size_t>(numel_));
+  read_mem(*ctx_, static_cast<cl_mem>(storage_), bits.data(), bytes_);
+  std::vector<float> host(bits.size());
+  for (size_t i = 0; i < bits.size(); ++i) host[i] = bf16_to_f32(bits[i]);
   return host;
 }
 
 Tensor Tensor::reshape(const std::vector<int>& shape) const {
   if (checked_numel(shape) != numel_) throw Error("tensor reshape numel mismatch");
-  Tensor out(*ctx_, shape);
+  Tensor out(*ctx_, shape, dtype_);
   out.copy_from(*this);
   return out;
 }

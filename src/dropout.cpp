@@ -1,5 +1,6 @@
 #include "nn/layers/dropout.hpp"
 
+#include "activate.hpp"
 #include "ensure.hpp"
 #include "nn/error.hpp"
 #include "ocl.hpp"
@@ -21,7 +22,7 @@ void Dropout::zero_grad() {}
 void Dropout::set_training(bool training) { training_ = training; }
 
 const Tensor& Dropout::forward(const Tensor& input) {
-  ensure_tensor(output_, *ctx_, input.shape());
+  ensure_activation(output_, *ctx_, input.shape());
   const bool drop = training_ && p_ > 0.f;
   if (!drop) {
     output_->copy_from(input);
@@ -40,7 +41,16 @@ const Tensor& Dropout::forward(const Tensor& input) {
     // copy_from_host is async. The host mask must stay alive until the upload finishes.
     ctx_->synchronize();
   }
-  launch_mul(*ctx_, output_->data(), input.data(), mask_->data(), input.numel());
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, input);
+    float* m = stage_f32(*ctx_, *mask_);
+    float* y = arena_f32(*ctx_, input.numel());
+    launch_mul(*ctx_, y, x, m, input.numel());
+    keep_f32(*ctx_, *output_, y);
+  } else {
+    launch_mul(*ctx_, output_->data(), input.data(), mask_->data(), input.numel());
+  }
   dropped_ = true;
   has_forward_ = true;
   return *output_;
@@ -50,9 +60,18 @@ const Tensor& Dropout::backward(const Tensor& grad_output) {
   if (!has_forward_ || !output_ || grad_output.shape() != output_->shape()) {
     throw Error("Dropout backward shape");
   }
-  ensure_tensor(grad_input_, *ctx_, grad_output.shape());
+  ensure_activation(grad_input_, *ctx_, grad_output.shape());
   if (!dropped_) {
     grad_input_->copy_from(grad_output);
+    return *grad_input_;
+  }
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    float* m = stage_f32(*ctx_, *mask_);
+    float* dx = arena_f32(*ctx_, grad_output.numel());
+    launch_mul(*ctx_, dx, dy, m, grad_output.numel());
+    keep_f32(*ctx_, *grad_input_, dx);
     return *grad_input_;
   }
   launch_mul(*ctx_, grad_input_->data(), grad_output.data(), mask_->data(), grad_output.numel());

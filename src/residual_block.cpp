@@ -1,5 +1,6 @@
 #include "nn/layers/residual_block.hpp"
 
+#include "activate.hpp"
 #include "ensure.hpp"
 #include "nn/error.hpp"
 #include "nn/layers/batch_norm2d.hpp"
@@ -98,8 +99,17 @@ const Tensor& ResidualBlock::forward(const Tensor& input) {
   const Tensor* skip = &input;
   if (project_) skip = &proj_bn_->forward(proj_->forward(input));
   if (skip->shape() != residual.shape()) throw Error("ResidualBlock skip shape");
-  ensure_tensor(sum_, *ctx_, residual.shape());
-  launch_add2(*ctx_, sum_->data(), residual.data(), skip->data(), residual.numel());
+  ensure_activation(sum_, *ctx_, residual.shape());
+  if (sum_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* a = stage_f32(*ctx_, residual);
+    float* b = stage_f32(*ctx_, *skip);
+    float* y = arena_f32(*ctx_, residual.numel());
+    launch_add2(*ctx_, y, a, b, residual.numel());
+    keep_f32(*ctx_, *sum_, y);
+  } else {
+    launch_add2(*ctx_, sum_->data(), residual.data(), skip->data(), residual.numel());
+  }
   return relu_out_->forward(*sum_);
 }
 
@@ -117,7 +127,16 @@ const Tensor& ResidualBlock::backward(const Tensor& grad_output) {
     g_skip = &proj_->backward(g_proj_bn);
   }
   if (g_main.shape() != g_skip->shape()) throw Error("ResidualBlock grad shape");
-  ensure_tensor(grad_input_, *ctx_, g_main.shape());
+  ensure_activation(grad_input_, *ctx_, g_main.shape());
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* a = stage_f32(*ctx_, g_main);
+    float* b = stage_f32(*ctx_, *g_skip);
+    float* y = arena_f32(*ctx_, g_main.numel());
+    launch_add2(*ctx_, y, a, b, g_main.numel());
+    keep_f32(*ctx_, *grad_input_, y);
+    return *grad_input_;
+  }
   launch_add2(*ctx_, grad_input_->data(), g_main.data(), g_skip->data(), g_main.numel());
   return *grad_input_;
 }

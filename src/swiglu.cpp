@@ -1,5 +1,6 @@
 #include "nn/layers/swiglu.hpp"
 
+#include "activate.hpp"
 #include "ensure.hpp"
 #include "nn/error.hpp"
 #include "ocl.hpp"
@@ -47,8 +48,17 @@ void SwiGLU::zero_grad() {}
 
 const Tensor& SwiGLU::forward(const Tensor& input) {
   const Split split = split_features(input.shape());
-  ensure_tensor(cache_x_, *ctx_, input.shape());
-  ensure_tensor(output_, *ctx_, split.output_shape);
+  ensure_activation(cache_x_, *ctx_, input.shape());
+  ensure_activation(output_, *ctx_, split.output_shape);
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, input);
+    float* y = arena_f32(*ctx_, output_->numel());
+    launch_swiglu(*ctx_, y, x, split.rows, split.inner);
+    keep_f32(*ctx_, *cache_x_, x);
+    keep_f32(*ctx_, *output_, y);
+    return *output_;
+  }
   cache_x_->copy_from(input);
   launch_swiglu(*ctx_, output_->data(), cache_x_->data(), split.rows, split.inner);
   return *output_;
@@ -59,7 +69,16 @@ const Tensor& SwiGLU::backward(const Tensor& grad_output) {
     throw Error("SwiGLU backward shape");
   }
   const Split split = split_features(cache_x_->shape());
-  ensure_tensor(grad_input_, *ctx_, cache_x_->shape());
+  ensure_activation(grad_input_, *ctx_, cache_x_->shape());
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, *cache_x_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    float* dx = arena_f32(*ctx_, cache_x_->numel());
+    launch_swiglu_backward(*ctx_, dx, x, dy, split.rows, split.inner);
+    keep_f32(*ctx_, *grad_input_, dx);
+    return *grad_input_;
+  }
   launch_swiglu_backward(*ctx_, grad_input_->data(), cache_x_->data(), grad_output.data(),
                          split.rows, split.inner);
   return *grad_input_;

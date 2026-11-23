@@ -1,5 +1,6 @@
 #include "nn/layers/linear.hpp"
 
+#include "activate.hpp"
 #include "ensure.hpp"
 #include "nn/error.hpp"
 #include "nn/init.hpp"
@@ -64,9 +65,22 @@ const Tensor& Linear::forward(const Tensor& input) {
   const int rows = gemm_rows(shape);
   std::vector<int> out_shape = shape;
   out_shape.back() = out_features_;
-  ensure_tensor(output_, *ctx_, out_shape);
-  ensure_tensor(cache_x_, *ctx_, shape);
+  ensure_activation(output_, *ctx_, out_shape);
+  ensure_activation(cache_x_, *ctx_, shape);
   cache_x_->copy_from(input);
+
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    const uint16_t* weight_bf = stage_bf16(*ctx_, weight_);
+    const int64_t stride_c = static_cast<int64_t>(rows) * out_features_;
+    const int64_t stride_a = static_cast<int64_t>(rows) * in_features_;
+    const int64_t stride_b = static_cast<int64_t>(out_features_) * in_features_;
+    gemm_nt_bf16(*ctx_, output_->bf16_data(), true, cache_x_->bf16_data(), weight_bf, rows, out_features_,
+                 in_features_, 1, out_features_, in_features_, in_features_, stride_c, stride_a, stride_b,
+                 1.f, 0.f);
+    if (bias_) launch_add_bias_bf16(*ctx_, output_->bf16_data(), bias_->data(), rows, out_features_);
+    return *output_;
+  }
 
   // Row-major y = x W^T. Weight layout is (out, in).
   gemm_nt(*ctx_, output_->data(), input.data(), weight_.data(), rows, out_features_, in_features_, 1,
@@ -88,7 +102,23 @@ const Tensor& Linear::backward(const Tensor& grad_output) {
   }
   if (in_shape.size() != 2 && in_shape.size() != 3) throw Error("Linear backward shape");
   const int rows = gemm_rows(in_shape);
-  ensure_tensor(grad_input_, *ctx_, in_shape);
+  ensure_activation(grad_input_, *ctx_, in_shape);
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    const uint16_t* grad_bf = stage_bf16(*ctx_, grad_output);
+    const uint16_t* weight_bf = stage_bf16(*ctx_, weight_);
+    const int64_t stride_g = static_cast<int64_t>(rows) * out_features_;
+    const int64_t stride_x = static_cast<int64_t>(rows) * in_features_;
+    const int64_t stride_w = static_cast<int64_t>(out_features_) * in_features_;
+    gemm_nn_bf16(*ctx_, grad_input_->bf16_data(), true, grad_bf, weight_bf, rows, in_features_,
+                 out_features_, 1, in_features_, out_features_, in_features_, stride_x, stride_g, stride_w,
+                 1.f, 0.f);
+    gemm_tn_bf16(*ctx_, grad_weight_.data(), false, grad_bf, cache_x_->bf16_data(), out_features_,
+                 in_features_, rows, 1, in_features_, out_features_, in_features_, stride_w, stride_g,
+                 stride_x, 1.f, 1.f);
+    if (grad_bias_) launch_bias_grad_bf16(*ctx_, grad_bf, grad_bias_->data(), rows, out_features_);
+    return *grad_input_;
+  }
   gemm_nn(*ctx_, grad_input_->data(), grad_output.data(), weight_.data(), rows, in_features_,
           out_features_, 1, in_features_, out_features_, in_features_,
           static_cast<int64_t>(rows) * in_features_, static_cast<int64_t>(rows) * out_features_,

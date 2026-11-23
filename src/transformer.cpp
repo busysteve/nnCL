@@ -1,5 +1,6 @@
 #include "nn/transformer.hpp"
 
+#include "activate.hpp"
 #include "ensure.hpp"
 #include "nn/error.hpp"
 #include "nn/layers/layer_norm.hpp"
@@ -34,15 +35,37 @@ void copy_ids(IndexTensor& dst, const std::vector<int64_t>& host, Context& ctx) 
 const Tensor& add_embeddings(Context& ctx, const Tensor& tok, const Tensor* pos, const Tensor* typ,
                              std::optional<Tensor>& dst, std::optional<Tensor>& scratch) {
   if (pos != nullptr && typ != nullptr) {
-    ensure_tensor(scratch, ctx, tok.shape());
+    ensure_activation(scratch, ctx, tok.shape());
+    ensure_activation(dst, ctx, tok.shape());
+    if (dst->dtype() == DType::BFloat16) {
+      arena_reset(ctx);
+      float* a = stage_f32(ctx, tok);
+      float* b = stage_f32(ctx, *pos);
+      float* s = arena_f32(ctx, tok.numel());
+      launch_add2(ctx, s, a, b, tok.numel());
+      float* c = stage_f32(ctx, *typ);
+      float* y = arena_f32(ctx, tok.numel());
+      launch_add2(ctx, y, s, c, tok.numel());
+      keep_f32(ctx, *scratch, s);
+      keep_f32(ctx, *dst, y);
+      return *dst;
+    }
     launch_add2(ctx, scratch->data(), tok.data(), pos->data(), tok.numel());
-    ensure_tensor(dst, ctx, tok.shape());
     launch_add2(ctx, dst->data(), scratch->data(), typ->data(), tok.numel());
     return *dst;
   }
   if (pos != nullptr || typ != nullptr) {
     const Tensor& extra = pos != nullptr ? *pos : *typ;
-    ensure_tensor(dst, ctx, tok.shape());
+    ensure_activation(dst, ctx, tok.shape());
+    if (dst->dtype() == DType::BFloat16) {
+      arena_reset(ctx);
+      float* a = stage_f32(ctx, tok);
+      float* b = stage_f32(ctx, extra);
+      float* y = arena_f32(ctx, tok.numel());
+      launch_add2(ctx, y, a, b, tok.numel());
+      keep_f32(ctx, *dst, y);
+      return *dst;
+    }
     launch_add2(ctx, dst->data(), tok.data(), extra.data(), tok.numel());
     return *dst;
   }

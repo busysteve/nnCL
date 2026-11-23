@@ -583,6 +583,15 @@ __kernel void write_kv(__global float* dst, __global const float* src, int t, in
   dst[(head * (long)t_max + t) * dh + d] = src[i];
 }
 
+__kernel void write_kv_u16(__global ushort* dst, __global const ushort* src, int t, int t_max, int dh,
+                           long n) {
+  const long i = (long)get_global_id(0);
+  if (i >= n) return;
+  const int d = (int)(i % dh);
+  const long head = i / dh;
+  dst[(head * (long)t_max + t) * dh + d] = src[i];
+}
+
 __kernel void softmax_rows(__global float* out, __global const float* in, int cols,
                            __local float* buffer) {
   const int row = (int)get_group_id(0);
@@ -995,4 +1004,144 @@ __kernel void batch_norm_backward(__global float* dx, __global const float* dy,
     const float dhat = dy[index] * scale;
     dx[index] = inv * (dhat - mean_dhat - xhat * mean_dhat_xhat);
   }
+}
+
+ushort f32_to_bf16(float value) {
+  uint bits = as_uint(value);
+  uint exp = bits & 0x7f800000u;
+  if (exp == 0x7f800000u) return (ushort)(bits >> 16);
+  uint lsb = (bits >> 16) & 1u;
+  bits += 0x7fffu + lsb;
+  return (ushort)(bits >> 16);
+}
+
+float bf16_to_f32(ushort bits) { return as_float(((uint)bits) << 16); }
+
+__kernel void cast_f32_to_bf16(__global ushort* dst, __global const float* src, long n) {
+  const long i = (long)get_global_id(0);
+  if (i < n) dst[i] = f32_to_bf16(src[i]);
+}
+
+__kernel void cast_bf16_to_f32(__global float* dst, __global const ushort* src, long n) {
+  const long i = (long)get_global_id(0);
+  if (i < n) dst[i] = bf16_to_f32(src[i]);
+}
+
+__kernel void add_bias_bf16(__global ushort* y, __global const float* bias, int rows, int cols) {
+  const long n = (long)rows * cols;
+  const long i = (long)get_global_id(0);
+  if (i >= n) return;
+  y[i] = f32_to_bf16(bf16_to_f32(y[i]) + bias[i % cols]);
+}
+
+__kernel void bias_grad_bf16(__global const ushort* grad_y, __global float* grad_bias, int rows, int cols,
+                             __local float* buffer) {
+  const int col = (int)get_group_id(0);
+  if (col >= cols) return;
+  float sum = 0.f;
+  for (int row = (int)get_local_id(0); row < rows; row += (int)get_local_size(0)) {
+    sum += bf16_to_f32(grad_y[(long)row * cols + col]);
+  }
+  sum = block_sum(sum, buffer);
+  if (get_local_id(0) == 0) grad_bias[col] += sum;
+}
+
+__kernel void gemm_nt_bf16(__global ushort* C, __global const ushort* A, __global const ushort* B, int M,
+                           int N, int K, int batches, int ldc, int lda, int ldb, long stride_c,
+                           long stride_a, long stride_b, float alpha, float beta) {
+  const int j = (int)get_global_id(0);
+  const int i = (int)get_global_id(1);
+  const int b = (int)get_global_id(2);
+  if (i >= M || j >= N || b >= batches) return;
+  const __global ushort* a = A + b * stride_a + (long)i * lda;
+  const __global ushort* brow = B + b * stride_b + (long)j * ldb;
+  float sum = 0.f;
+  for (int p = 0; p < K; ++p) sum += bf16_to_f32(a[p]) * bf16_to_f32(brow[p]);
+  __global ushort* c = C + b * stride_c + (long)i * ldc + j;
+  float out = alpha * sum;
+  if (beta != 0.f) out += beta * bf16_to_f32(*c);
+  *c = f32_to_bf16(out);
+}
+
+__kernel void gemm_nt_bf16_f32(__global float* C, __global const ushort* A, __global const ushort* B, int M,
+                               int N, int K, int batches, int ldc, int lda, int ldb, long stride_c,
+                               long stride_a, long stride_b, float alpha, float beta) {
+  const int j = (int)get_global_id(0);
+  const int i = (int)get_global_id(1);
+  const int b = (int)get_global_id(2);
+  if (i >= M || j >= N || b >= batches) return;
+  const __global ushort* a = A + b * stride_a + (long)i * lda;
+  const __global ushort* brow = B + b * stride_b + (long)j * ldb;
+  float sum = 0.f;
+  for (int p = 0; p < K; ++p) sum += bf16_to_f32(a[p]) * bf16_to_f32(brow[p]);
+  __global float* c = C + b * stride_c + (long)i * ldc + j;
+  *c = (beta == 0.f) ? alpha * sum : alpha * sum + beta * (*c);
+}
+
+__kernel void gemm_nn_bf16(__global ushort* C, __global const ushort* A, __global const ushort* B, int M,
+                           int N, int K, int batches, int ldc, int lda, int ldb, long stride_c,
+                           long stride_a, long stride_b, float alpha, float beta) {
+  const int j = (int)get_global_id(0);
+  const int i = (int)get_global_id(1);
+  const int b = (int)get_global_id(2);
+  if (i >= M || j >= N || b >= batches) return;
+  const __global ushort* a = A + b * stride_a + (long)i * lda;
+  const __global ushort* bbase = B + b * stride_b;
+  float sum = 0.f;
+  for (int p = 0; p < K; ++p) sum += bf16_to_f32(a[p]) * bf16_to_f32(bbase[(long)p * ldb + j]);
+  __global ushort* c = C + b * stride_c + (long)i * ldc + j;
+  float out = alpha * sum;
+  if (beta != 0.f) out += beta * bf16_to_f32(*c);
+  *c = f32_to_bf16(out);
+}
+
+__kernel void gemm_nn_bf16_f32(__global float* C, __global const ushort* A, __global const ushort* B, int M,
+                               int N, int K, int batches, int ldc, int lda, int ldb, long stride_c,
+                               long stride_a, long stride_b, float alpha, float beta) {
+  const int j = (int)get_global_id(0);
+  const int i = (int)get_global_id(1);
+  const int b = (int)get_global_id(2);
+  if (i >= M || j >= N || b >= batches) return;
+  const __global ushort* a = A + b * stride_a + (long)i * lda;
+  const __global ushort* bbase = B + b * stride_b;
+  float sum = 0.f;
+  for (int p = 0; p < K; ++p) sum += bf16_to_f32(a[p]) * bf16_to_f32(bbase[(long)p * ldb + j]);
+  __global float* c = C + b * stride_c + (long)i * ldc + j;
+  *c = (beta == 0.f) ? alpha * sum : alpha * sum + beta * (*c);
+}
+
+__kernel void gemm_tn_bf16(__global ushort* C, __global const ushort* A, __global const ushort* B, int M,
+                           int N, int K, int batches, int ldc, int lda, int ldb, long stride_c,
+                           long stride_a, long stride_b, float alpha, float beta) {
+  const int j = (int)get_global_id(0);
+  const int i = (int)get_global_id(1);
+  const int b = (int)get_global_id(2);
+  if (i >= M || j >= N || b >= batches) return;
+  const __global ushort* abase = A + b * stride_a;
+  const __global ushort* bbase = B + b * stride_b;
+  float sum = 0.f;
+  for (int p = 0; p < K; ++p) {
+    sum += bf16_to_f32(abase[(long)p * lda + i]) * bf16_to_f32(bbase[(long)p * ldb + j]);
+  }
+  __global ushort* c = C + b * stride_c + (long)i * ldc + j;
+  float out = alpha * sum;
+  if (beta != 0.f) out += beta * bf16_to_f32(*c);
+  *c = f32_to_bf16(out);
+}
+
+__kernel void gemm_tn_bf16_f32(__global float* C, __global const ushort* A, __global const ushort* B, int M,
+                               int N, int K, int batches, int ldc, int lda, int ldb, long stride_c,
+                               long stride_a, long stride_b, float alpha, float beta) {
+  const int j = (int)get_global_id(0);
+  const int i = (int)get_global_id(1);
+  const int b = (int)get_global_id(2);
+  if (i >= M || j >= N || b >= batches) return;
+  const __global ushort* abase = A + b * stride_a;
+  const __global ushort* bbase = B + b * stride_b;
+  float sum = 0.f;
+  for (int p = 0; p < K; ++p) {
+    sum += bf16_to_f32(abase[(long)p * lda + i]) * bf16_to_f32(bbase[(long)p * ldb + j]);
+  }
+  __global float* c = C + b * stride_c + (long)i * ldc + j;
+  *c = (beta == 0.f) ? alpha * sum : alpha * sum + beta * (*c);
 }

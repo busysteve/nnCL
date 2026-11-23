@@ -1,5 +1,6 @@
 #include "nn/layers/layer_norm.hpp"
 
+#include "activate.hpp"
 #include "ensure.hpp"
 #include "nn/error.hpp"
 #include "ocl.hpp"
@@ -53,10 +54,20 @@ void LayerNorm::zero_grad() {
 const Tensor& LayerNorm::forward(const Tensor& input) {
   const int rows = normalized_rows(input, normalized_shape_);
   const std::vector<int>& shape = input.shape();
-  ensure_tensor(cache_x_, *ctx_, shape);
-  ensure_tensor(output_, *ctx_, shape);
+  ensure_activation(cache_x_, *ctx_, shape);
+  ensure_activation(output_, *ctx_, shape);
   ensure_tensor(mean_, *ctx_, std::vector<int>{rows});
   ensure_tensor(inv_std_, *ctx_, std::vector<int>{rows});
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, input);
+    float* y = arena_f32(*ctx_, output_->numel());
+    launch_layer_norm_forward(*ctx_, y, mean_->data(), inv_std_->data(), x, weight_.data(),
+                              bias_.data(), rows, normalized_shape_, eps_);
+    keep_f32(*ctx_, *cache_x_, x);
+    keep_f32(*ctx_, *output_, y);
+    return *output_;
+  }
   cache_x_->copy_from(input);
   launch_layer_norm_forward(*ctx_, output_->data(), mean_->data(), inv_std_->data(), cache_x_->data(),
                             weight_.data(), bias_.data(), rows, normalized_shape_, eps_);
@@ -68,7 +79,19 @@ const Tensor& LayerNorm::backward(const Tensor& grad_output) {
     throw Error("LayerNorm backward shape");
   }
   const int rows = static_cast<int>(mean_->numel());
-  ensure_tensor(grad_input_, *ctx_, cache_x_->shape());
+  ensure_activation(grad_input_, *ctx_, cache_x_->shape());
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, *cache_x_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    float* dx = arena_f32(*ctx_, grad_input_->numel());
+    launch_layer_norm_backward_input(*ctx_, dx, dy, x, mean_->data(), inv_std_->data(),
+                                     weight_.data(), rows, normalized_shape_);
+    launch_layer_norm_param_grad(*ctx_, dy, x, mean_->data(), inv_std_->data(), grad_weight_.data(),
+                                 grad_bias_.data(), rows, normalized_shape_);
+    keep_f32(*ctx_, *grad_input_, dx);
+    return *grad_input_;
+  }
   launch_layer_norm_backward_input(*ctx_, grad_input_->data(), grad_output.data(), cache_x_->data(),
                                    mean_->data(), inv_std_->data(), weight_.data(), rows,
                                    normalized_shape_);

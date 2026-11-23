@@ -169,6 +169,7 @@ void condition_bn(nn::Layer& layer) {
 
 int test_gradients() {
   nn::Context ctx;
+  ctx.set_activation_dtype(nn::DType::Float32);
   std::mt19937 rng(1);
 
   std::printf("grad linear\n");

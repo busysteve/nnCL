@@ -176,6 +176,7 @@ int test_mnist() {
     CHECK(correct >= floor);
     net.save(path, nullptr);
     nn::Context loaded_ctx;
+    loaded_ctx.set_activation_dtype(nn::DType::Float32);
     nn::Network::Loaded loaded = nn::Network::load(loaded_ctx, path, nn::LoadMode::Inference);
     CHECK(!loaded.optimizer.has_value());
     CHECK(!loaded.network.training());
@@ -190,6 +191,7 @@ int test_mnist() {
 
   if(0){
     nn::Context ctx;
+    ctx.set_activation_dtype(nn::DType::Float32);
     nn::MlpConfig config;
     config.input_size = 784;
     config.hidden = {256, 128};
@@ -198,6 +200,7 @@ int test_mnist() {
   }
   if(0){
     nn::Context ctx;
+    ctx.set_activation_dtype(nn::DType::Float32);
     nn::ConvConfig config;
     config.in_channels = 1;
     config.in_height = 28;
@@ -209,6 +212,7 @@ int test_mnist() {
   }
   if(0){
     nn::Context ctx;
+    ctx.set_activation_dtype(nn::DType::Float32);
     nn::ResNetConfig config;
     config.in_channels = 1;
     config.in_height = 28;
@@ -221,6 +225,7 @@ int test_mnist() {
   }
   if(1){
     nn::Context ctx;
+    ctx.set_activation_dtype(nn::DType::Float32);
     nn::ConvResNetConfig config;
     config.in_channels = 1;
     config.in_height = 28;

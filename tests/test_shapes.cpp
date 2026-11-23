@@ -937,6 +937,7 @@ void check_cached_decode(nn::Context& ctx, std::mt19937& rng) {
 
 int test_shapes() {
   nn::Context ctx;
+  ctx.set_activation_dtype(nn::DType::Float32);
   std::mt19937 rng(1);
 
   {
@@ -1936,6 +1937,7 @@ int test_shapes() {
     expect_close(row_out.to_host(), {3.f, 4.f, 5.f, 6.f, 1.f, 2.f}, "embedding rows");
 
     nn::Context other;
+    other.set_activation_dtype(nn::DType::Float32);
     nn::IndexTensor foreign(other, {1});
     const int64_t zero = 0;
     foreign.copy_from_host(&zero, 1);
