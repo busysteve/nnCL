@@ -65,6 +65,7 @@ void write_mem(Context& ctx, cl_mem mem, const void* src, size_t bytes);
 void read_mem(Context& ctx, cl_mem mem, void* dst, size_t bytes);
 void fill_mem_f(Context& ctx, cl_mem mem, float value, size_t count);
 void fill_mem_i(Context& ctx, cl_mem mem, int value, size_t count);
+void zero_mem(Context& ctx, cl_mem mem, size_t bytes);
 void copy_mem(Context& ctx, cl_mem dst, cl_mem src, size_t bytes);
 
 inline cl_mem mem_of(const float* p) { return reinterpret_cast<cl_mem>(const_cast<float*>(p)); }

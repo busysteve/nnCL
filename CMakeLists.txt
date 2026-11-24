@@ -80,6 +80,7 @@ add_executable(nn_tests
   tests/test_checkpoint.cpp
   tests/test_mnist.cpp
   tests/test_bf16.cpp
+  tests/test_fill.cpp
   tests/mnist.cpp
 )
 
@@ -92,5 +93,6 @@ add_test(NAME grads COMMAND nn_tests grads)
 add_test(NAME ckpt COMMAND nn_tests ckpt)
 add_test(NAME mnist COMMAND nn_tests mnist)
 add_test(NAME bf16 COMMAND nn_tests bf16)
-set_tests_properties(shapes grads ckpt PROPERTIES TIMEOUT 900)
+add_test(NAME fill COMMAND nn_tests fill)
+set_tests_properties(shapes grads ckpt bf16 fill PROPERTIES TIMEOUT 900)
 set_tests_properties(mnist PROPERTIES TIMEOUT 7200)

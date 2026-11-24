@@ -113,13 +113,7 @@ void Tensor::fill(float value) {
   ctx_->synchronize();
 }
 
-void Tensor::zero() {
-  const uint16_t pattern = 0;
-  cl_command_queue queue = ContextAccess::get(*ctx_).queue;
-  check_cl(clEnqueueFillBuffer(queue, static_cast<cl_mem>(storage_), &pattern, sizeof(pattern), 0, bytes_,
-                               0, nullptr, nullptr),
-           "clEnqueueFillBuffer");
-}
+void Tensor::zero() { zero_mem(*ctx_, static_cast<cl_mem>(storage_), bytes_); }
 
 void Tensor::scale(float factor) {
   if (dtype_ == DType::Float32) {
