@@ -90,6 +90,22 @@ __kernel void scale_f(__global float* x, long n, float factor) {
   if (i < n) x[i] *= factor;
 }
 
+// Apple clEnqueueFillBuffer returns CL_SUCCESS and writes the wrong bytes.
+__kernel void fill_f32(__global float* x, long n, float value) {
+  const long i = (long)get_global_id(0);
+  if (i < n) x[i] = value;
+}
+
+__kernel void fill_i32(__global int* x, long n, int value) {
+  const long i = (long)get_global_id(0);
+  if (i < n) x[i] = value;
+}
+
+__kernel void fill_u16(__global ushort* x, long n, int value) {
+  const long i = (long)get_global_id(0);
+  if (i < n) x[i] = (ushort)value;
+}
+
 __kernel void add_bias(__global float* y, __global const float* bias, int rows, int cols) {
   const long n = (long)rows * cols;
   const long i = (long)get_global_id(0);

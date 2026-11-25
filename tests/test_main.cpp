@@ -6,10 +6,11 @@ int test_gradients();
 int test_checkpoint();
 int test_mnist();
 int test_bf16();
+int test_fill();
 
 int main(int argc, char** argv) {
   if (argc != 2) {
-    std::fprintf(stderr, "usage: nn_tests shapes|grads|ckpt|mnist|bf16\n");
+    std::fprintf(stderr, "usage: nn_tests shapes|grads|ckpt|mnist|bf16|fill\n");
     return 1;
   }
   if (std::strcmp(argv[1], "shapes") == 0) return test_shapes();
@@ -17,6 +18,7 @@ int main(int argc, char** argv) {
   if (std::strcmp(argv[1], "ckpt") == 0) return test_checkpoint();
   if (std::strcmp(argv[1], "mnist") == 0) return test_mnist();
   if (std::strcmp(argv[1], "bf16") == 0) return test_bf16();
-  std::fprintf(stderr, "usage: nn_tests shapes|grads|ckpt|mnist|bf16\n");
+  if (std::strcmp(argv[1], "fill") == 0) return test_fill();
+  std::fprintf(stderr, "usage: nn_tests shapes|grads|ckpt|mnist|bf16|fill\n");
   return 1;
 }

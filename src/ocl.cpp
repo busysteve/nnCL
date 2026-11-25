@@ -378,9 +378,15 @@ void Context::Impl::open(int index) {
   dummy = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(float), nullptr, &err);
   check_cl(err, "clCreateBuffer");
   const float zero = 0.f;
+#if defined(__APPLE__)
+  // clEnqueueFillBuffer returns success on Apple and does not write the pattern.
+  check_cl(clEnqueueWriteBuffer(queue, dummy, CL_TRUE, 0, sizeof(zero), &zero, 0, nullptr, nullptr),
+           "clEnqueueWriteBuffer");
+#else
   check_cl(clEnqueueFillBuffer(queue, dummy, &zero, sizeof(zero), 0, sizeof(zero), 0, nullptr,
                                nullptr),
            "clEnqueueFillBuffer");
+#endif
 }
 
 Context::Impl::~Impl() {
@@ -432,16 +438,51 @@ void read_mem(Context& ctx, cl_mem mem, void* dst, size_t bytes) {
 
 void fill_mem_f(Context& ctx, cl_mem mem, float value, size_t count) {
   if (count == 0) return;
+#if defined(__APPLE__)
+  KernelCall(ctx, "fill_f32").mem(mem).l(static_cast<cl_long>(count)).f(value).over(
+      static_cast<int64_t>(count), 256);
+#else
   check_cl(clEnqueueFillBuffer(queue_of(ctx), mem, &value, sizeof(value), 0, count * sizeof(value),
                                0, nullptr, nullptr),
            "clEnqueueFillBuffer");
+#endif
 }
 
 void fill_mem_i(Context& ctx, cl_mem mem, int value, size_t count) {
   if (count == 0) return;
+#if defined(__APPLE__)
+  KernelCall(ctx, "fill_i32").mem(mem).l(static_cast<cl_long>(count)).i(value).over(
+      static_cast<int64_t>(count), 256);
+#else
   check_cl(clEnqueueFillBuffer(queue_of(ctx), mem, &value, sizeof(value), 0, count * sizeof(value),
                                0, nullptr, nullptr),
            "clEnqueueFillBuffer");
+#endif
+}
+
+void zero_mem(Context& ctx, cl_mem mem, size_t bytes) {
+  if (bytes == 0) return;
+#if defined(__APPLE__)
+  if (bytes % sizeof(float) == 0) {
+    fill_mem_f(ctx, mem, 0.f, bytes / sizeof(float));
+    return;
+  }
+  if (bytes % sizeof(uint16_t) == 0) {
+    KernelCall(ctx, "fill_u16")
+        .mem(mem)
+        .l(static_cast<cl_long>(bytes / sizeof(uint16_t)))
+        .i(0)
+        .over(static_cast<int64_t>(bytes / sizeof(uint16_t)), 256);
+    return;
+  }
+  std::vector<unsigned char> zeros(bytes, 0);
+  write_mem(ctx, mem, zeros.data(), bytes);
+#else
+  const uint16_t pattern = 0;
+  check_cl(clEnqueueFillBuffer(queue_of(ctx), mem, &pattern, sizeof(pattern), 0, bytes, 0, nullptr,
+                               nullptr),
+           "clEnqueueFillBuffer");
+#endif
 }
 
 void copy_mem(Context& ctx, cl_mem dst, cl_mem src, size_t bytes) {
