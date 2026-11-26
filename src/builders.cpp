@@ -207,39 +207,28 @@ Network build_rnn(Context& ctx, const RnnConfig& config, uint32_t seed) {
 
 Network build_transformer_network(Context& ctx, const TransformerConfig& config, uint32_t seed) {
   validate(config);
+  const TransformerConfig built = apply_bias_flags(config);
   std::mt19937 rng(seed);
   std::vector<std::unique_ptr<Layer>> layers;
-  for (int i = 0; i < config.num_layers; ++i) {
+  for (int i = 0; i < built.num_layers; ++i) {
     TransformerBlockSpec spec;
-    spec.d_model = config.d_model;
-    spec.num_heads = config.num_heads;
-    spec.d_ff = config.d_ff;
-    spec.dropout = config.dropout;
-    spec.bias = config.bias;
-    spec.use_rope = config.positional == PositionalEncoding::Rope;
-    spec.activation = config.activation;
-    spec.head_dim = config.head_dim;
-    spec.num_kv_heads = config.num_kv_heads;
-    spec.qk_norm = config.qk_norm;
-    spec.rope_theta = config.rope_theta;
-    spec.rms_eps = config.rms_eps;
-    spec.causal = config.causal;
+    fill_transformer_block_spec(spec, built);
     auto block = std::make_unique<TransformerBlock>(ctx, spec, rng);
     block->set_name(index_name("blocks", static_cast<size_t>(i)));
     layers.push_back(std::move(block));
   }
   std::unique_ptr<Layer> final_ln;
-  if (config.positional == PositionalEncoding::Rope) {
-    final_ln = std::make_unique<RMSNorm>(ctx, config.d_model, config.rms_eps);
+  if (built.positional == PositionalEncoding::Rope) {
+    final_ln = std::make_unique<RMSNorm>(ctx, built.d_model, built.rms_eps);
   } else {
-    final_ln = std::make_unique<LayerNorm>(ctx, config.d_model);
+    final_ln = std::make_unique<LayerNorm>(ctx, built.d_model);
   }
   final_ln->set_name("final_ln");
   layers.push_back(std::move(final_ln));
-  auto lm_head = std::make_unique<Linear>(ctx, config.d_model, config.vocab_size, config.bias, rng);
+  auto lm_head = std::make_unique<Linear>(ctx, built.d_model, built.vocab_size, built.lm_head_bias, rng);
   lm_head->set_name("lm_head");
   layers.push_back(std::move(lm_head));
-  return Network(ctx, Family::Transformer, std::move(layers), config);
+  return Network(ctx, Family::Transformer, std::move(layers), built);
 }
 
 }  // namespace nn

@@ -53,6 +53,10 @@ class Transformer {
   // when attention is bidirectional or a segment table is present.
   // An AdamW* (including null) is version 2, version 4 for that Qwen block,
   // or version 6 for the bidirectional block.
+  // A config whose projection bias differs from bias, or whose later graph
+  // fields differ from the version 1–6 defaults, is version 7 with no
+  // optimizer block and version 8 when an optimizer block is written. A null
+  // AdamW* on that config writes version 7.
   void save(const std::filesystem::path& path, std::nullptr_t) const {
     save(path, static_cast<const Sgd*>(nullptr));
   }

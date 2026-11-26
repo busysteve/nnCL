@@ -88,6 +88,26 @@ struct TransformerConfig {
   float rms_eps = 1e-5f;
   bool causal = true;        // false is bidirectional attention, as in BERT
   int type_vocab_size = 0;   // 0 omits the segment table. BERT uses 2.
+  // Linear bias per projection. split_bias is not written to the file.
+  // When it is false, construction sets the four flags equal to bias.
+  bool qkv_bias = false;
+  bool attn_out_bias = false;
+  bool mlp_bias = false;
+  bool lm_head_bias = false;
+  bool split_bias = false;
+  bool gelu_tanh = false;          // erf GELU until a later step builds the tanh form
+  int rope_dims = 0;               // 0 rotates the whole head
+  int sliding_window = 0;          // 0 is a strict causal mask
+  uint32_t rope_scaling = 0;       // 0 none, 1 llama3
+  float rope_factor = 0.f;
+  float rope_low_freq_factor = 0.f;
+  float rope_high_freq_factor = 0.f;
+  int rope_original_context = 0;
+  bool post_norm = false;
+  bool embed_norm = false;
+  float embed_norm_eps = 1e-5f;
+  bool final_norm = true;
+  bool mlm_head = false;
 };
 
 int conv_out_size(int in, int kernel, int stride, int pad);
@@ -98,5 +118,6 @@ void validate(const ResNetConfig& config);
 void validate(const ConvResNetConfig& config);
 void validate(const RnnConfig& config);
 void validate(const TransformerConfig& config);
+TransformerConfig apply_bias_flags(TransformerConfig config);
 
 }  // namespace nn

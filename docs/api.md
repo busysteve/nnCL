@@ -9,7 +9,7 @@ This is the contract of the C++ API in namespace `nn`. Two libraries implement i
 
 The public headers under `include/nn/` are the same in both trees. The only header that differs is `nn/context.hpp`, and the difference is comments. A checkpoint written by one library loads in the other. `src/checkpoint.cpp` is the same file in both trees.
 
-`nn/USAGE.md` is a programmer's guide for the CUDA tree. This document is the contract. It includes the Qwen-style attention fields and checkpoint versions 1 through 6.
+`nn/USAGE.md` is a programmer's guide for the CUDA tree. This document is the contract. It includes the Qwen-style attention fields and checkpoint versions 1 through 8.
 
 The CMake target is `nn` in both trees. Headers do not include CUDA, OpenCL, cuBLAS, or cuDNN headers. A program that links `libnn.a` by hand also links the backend libraries that archive was built against: `CUDA::cudart`, `CUDA::cublas`, and cuDNN for `nn`; the OpenCL loader for `nnCL`.
 
@@ -514,7 +514,9 @@ Header: `nn/layers/multi_head_attention.hpp`
 ```cpp
 MultiHeadAttention(Context& ctx, int d_model, int num_heads, bool causal, bool use_bias,
                    bool use_rope, std::mt19937& rng, int head_dim = 0, int num_kv_heads = 0,
-                   bool qk_norm = false, float rope_theta = 10000.f, float rms_eps = 1e-5f);
+                   bool qk_norm = false, float rope_theta = 10000.f, float rms_eps = 1e-5f,
+                   std::optional<bool> qkv_bias = std::nullopt,
+                   std::optional<bool> attn_out_bias = std::nullopt);
 
 struct Cache {
   Tensor k;  // (N, num_heads, T_max, head_dim) after KV repeat
@@ -530,7 +532,7 @@ const Tensor& forward_cached(const Tensor& x_t, Cache& cache);
 
 `use_rope == true` rotates Q and K after QK-norm: adjacent pairs inside each head, base `rope_theta`, over the whole head dimension. V is not rotated. An odd head dimension throws `std::invalid_argument` with message `use_rope`. `rope_theta` must be finite and greater than 0 (`rope_theta`). `rms_eps` must be finite and greater than 0 (`rms_eps`). Those two checks run even when `use_rope` and `qk_norm` are false. There is no attention dropout. `set_training` does not change the result.
 
-The layer owns four `Linear` children, constructed in order `q`, `k`, `v`, `out`. `q` maps `d_model` to `num_heads * head_dim`. `k` and `v` map `d_model` to `num_kv_heads * head_dim`. `out` maps `num_heads * head_dim` back to `d_model`. Each child uses `use_bias` and draws its weight from `rng`. Bias, when present, starts at 0 and consumes no random numbers. When `head_dim == 0` and `num_kv_heads == 0`, `q`, `k`, `v`, and `out` are square at `d_model`.
+The layer owns four `Linear` children, constructed in order `q`, `k`, `v`, `out`. `q` maps `d_model` to `num_heads * head_dim`. `k` and `v` map `d_model` to `num_kv_heads * head_dim`. `out` maps `num_heads * head_dim` back to `d_model`. Each child uses `use_bias` when the matching optional is unset. `qkv_bias` covers `q`, `k`, and `v`. `attn_out_bias` covers `out`. Each child draws its weight from `rng`. Bias, when present, starts at 0 and consumes no random numbers. When `head_dim == 0` and `num_kv_heads == 0`, `q`, `k`, `v`, and `out` are square at `d_model`.
 
 When `qk_norm` is true, the layer also owns `q_norm` and `k_norm`, each an `RMSNorm` of width `head_dim` and epsilon `rms_eps`. Their weights start at 1 and consume no random numbers.
 
@@ -584,6 +586,11 @@ struct TransformerBlockSpec {
   float rope_theta = 10000.f;
   float rms_eps = 1e-5f;
   bool causal = true;
+  bool qkv_bias = false;
+  bool attn_out_bias = false;
+  bool mlp_bias = false;
+  bool lm_head_bias = false;
+  bool split_bias = false;
 };
 
 TransformerBlock(Context& ctx, const TransformerBlockSpec& spec, std::mt19937& rng);
@@ -600,7 +607,7 @@ h = x + drop1(mha(ln1(x)))
 y = h + drop2(ffn(ln2(h)))
 ```
 
-`d_ff` is the width after the gate. GELU is `Linear(d_model → d_ff)`, `GELU`, `Linear(d_ff → d_model)`. SwiGLU is `Linear(d_model → 2*d_ff)`, `SwiGLU`, `Linear(d_ff → d_model)`. Both linears use `bias`. `attn()` is the owned attention layer. `set_training` reaches both dropouts and every child. Child parameter prefixes are `ln1.`, `attn.`, `drop1.`, `ln2.`, `fc1.`, `fc2.`. Dropout and the activation have no parameters. `forward` takes `(N, T, d_model)` and returns the same shape. A rank other than 3, or a last dimension other than `d_model`, throws `TransformerBlock input shape`. A missing forward or a mismatched gradient throws `TransformerBlock backward shape`.
+`d_ff` is the width after the gate. GELU is `Linear(d_model → d_ff)`, `GELU`, `Linear(d_ff → d_model)`. SwiGLU is `Linear(d_model → 2*d_ff)`, `SwiGLU`, `Linear(d_ff → d_model)`. Both linears use `mlp_bias` when `split_bias` is set, and `bias` otherwise. Q, K, and V use `qkv_bias` the same way. The attention output uses `attn_out_bias`. `attn()` is the owned attention layer. `set_training` reaches both dropouts and every child. Child parameter prefixes are `ln1.`, `attn.`, `drop1.`, `ln2.`, `fc1.`, `fc2.`. Dropout and the activation have no parameters. `forward` takes `(N, T, d_model)` and returns the same shape. A rank other than 3, or a last dimension other than `d_model`, throws `TransformerBlock input shape`. A missing forward or a mismatched gradient throws `TransformerBlock backward shape`.
 
 `forward_cached` is the same residual with `mha->forward_cached` in place of `mha->forward`. `x_t` and `y` are `(N, 1, d_model)`. Dropout follows `set_training`. Generation calls `eval()`, so dropout is the identity.
 
@@ -817,12 +824,17 @@ struct TransformerConfig {
   float rms_eps = 1e-5f;
   bool causal = true;        // false is bidirectional attention
   int type_vocab_size = 0;   // 0 omits the segment table
+  bool qkv_bias = false;
+  bool attn_out_bias = false;
+  bool mlp_bias = false;
+  bool lm_head_bias = false;
+  bool split_bias = false;   // not stored. false makes the four flags follow bias
 };
 ```
 
 `validate` requires `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, and `max_seq_len` to be at least 1. `head_dim == 0` requires `d_model % num_heads == 0` (`num_heads`). `head_dim < 0` throws `head_dim`. `num_kv_heads == 0` means `num_heads`. Otherwise `num_kv_heads` is in `1 .. num_heads` and divides `num_heads` (`num_kv_heads`). `head_dim * num_heads` and `head_dim * num_kv_heads` must fit in a positive `int` (`head_dim`). The resolved head dimension is `head_dim` when it is positive, and `d_model / num_heads` otherwise.
 
-`dropout` is in `[0, 1)` (`dropout`). `tie_embeddings == true` throws `tie_embeddings`. Embeddings are never tied to the output projection. `activation` is `Gelu` or `SwiGLU` (`activation`). `positional` is `LearnedAbsolute` or `Rope` (`positional`). `Rope` with an odd resolved head dimension throws `use_rope`. `rope_theta` must be finite and greater than 0 (`rope_theta`). `rms_eps` must be finite and greater than 0 (`rms_eps`). Those two checks run for every positional encoding. SwiGLU with `d_ff > INT_MAX / 2` throws `d_ff`. `type_vocab_size < 0` throws `type_vocab_size`. `0` omits the segment table. A positive value builds `type_emb`. `causal` false is bidirectional attention. The default is causal.
+`dropout` is in `[0, 1)` (`dropout`). `tie_embeddings == true` throws `tie_embeddings`. Embeddings are never tied to the output projection. `activation` is `Gelu` or `SwiGLU` (`activation`). `positional` is `LearnedAbsolute` or `Rope` (`positional`). `Rope` with an odd resolved head dimension throws `use_rope`. `rope_theta` must be finite and greater than 0 (`rope_theta`). `rms_eps` must be finite and greater than 0 (`rms_eps`). Those two checks run for every positional encoding. SwiGLU with `d_ff > INT_MAX / 2` throws `d_ff`. `type_vocab_size < 0` throws `type_vocab_size`. `0` omits the segment table. A positive value builds `type_emb`. `causal` false is bidirectional attention. The default is causal. `split_bias` false sets `qkv_bias`, `attn_out_bias`, `mlp_bias`, and `lm_head_bias` equal to `bias` before the linears are built. `split_bias` true keeps the four flags. `qkv_bias` covers Q, K, and V. `mlp_bias` covers `fc1` and `fc2`. A negative `rope_dims`, an odd or too-wide non-zero `rope_dims`, a negative `sliding_window`, `rope_scaling` above 1, a llama3 `rope_factor` that is not finite and greater than 0, or `mlm_head` on a causal model throws that field name. `validate` also rejects `gelu_tanh`, a non-zero `rope_dims` or `sliding_window`, a non-zero `rope_scaling`, `post_norm`, `embed_norm`, `final_norm` false, and `mlm_head`. Those fields are stored on a version-7 file and are not computed yet.
 
 `rope_theta` is applied only when `positional` is `Rope`. `rms_eps` is applied to RMSNorm: the block norms and `final_ln` on the RoPE path, and QK-norm whenever `qk_norm` is true. Learned-absolute `LayerNorm` stays at epsilon `1e-5`. A `rope_theta` other than `10000` or an `rms_eps` other than `1e-5` still selects an extended checkpoint version, including on a learned-absolute model that does not apply that value.
 
@@ -889,7 +901,7 @@ Each builder validates the config, seeds one `std::mt19937` with `seed`, and ret
 
 The public constructor is for a caller who already owns the layers. `save` writes `family` and `config`. `load` rebuilds with the builder for that family, then requires the parameter and batch-norm records to match that builder's names and shapes. A checkpoint round-trip is defined for a network produced by one of the six builders.
 
-`build_transformer_network` emits `num_layers` blocks named `blocks.i`, then `final_ln`, then `Linear` named `lm_head` from `d_model` to `vocab_size`. The trunk does not own token embeddings, a position table, or a segment table. Each block sets `use_rope` from `positional == Rope`, and copies `head_dim`, `num_kv_heads`, `qk_norm`, `rope_theta`, `rms_eps`, and `causal`. The final norm is `RMSNorm` with `rms_eps` on the RoPE path and `LayerNorm` with epsilon `1e-5` otherwise. `lm_head` uses `bias`. `max_seq_len` is stored on the config and in the checkpoint. The trunk forward does not check `T` against `max_seq_len`.
+`build_transformer_network` emits `num_layers` blocks named `blocks.i`, then `final_ln`, then `Linear` named `lm_head` from `d_model` to `vocab_size`. The trunk does not own token embeddings, a position table, or a segment table. Each block sets `use_rope` from `positional == Rope`, and copies `head_dim`, `num_kv_heads`, `qk_norm`, `rope_theta`, `rms_eps`, and `causal`. The final norm is `RMSNorm` with `rms_eps` on the RoPE path and `LayerNorm` with epsilon `1e-5` otherwise. `lm_head` uses `lm_head_bias` when `split_bias` is set, and `bias` otherwise. `max_seq_len` is stored on the config and in the checkpoint. The trunk forward does not check `T` against `max_seq_len`.
 
 Trunk input is a float tensor `(N, T, d_model)`. Trunk output is `(N, T, vocab_size)`.
 
@@ -1080,7 +1092,7 @@ Header, 32 bytes:
 | Offset | Type | Field |
 |---|---|---|
 | 0 | `uint32` | Magic `0x314E4E43` (`CNN1` on a little-endian disk) |
-| 4 | `uint32` | Version, 1 through 6 |
+| 4 | `uint32` | Version, 1 through 8 |
 | 8 | `uint32` | `Family`, 1 through 6 |
 | 12 | `uint32` | `training`, 0 or 1 |
 | 16 | `uint64` | Optimizer step, or 0 when no optimizer is stored |
@@ -1097,7 +1109,7 @@ After the header comes the config for `family`, padded to 8, then the parameter 
 
 A non-transformer file is version 1 from `save(path, const Sgd*)`, including a null `Sgd*`, and version 2 from `save(path, const AdamW*)`, including a null `AdamW*`.
 
-A transformer file, whether saved from the trunk or from the façade, picks a version from the config. Bert wins over the extended block. The extended block is true when any of these hold:
+A transformer file, whether saved from the trunk or from the façade, picks a version from the config. A projection-bias file wins over bert, and bert wins over the extended block. The projection-bias file is true when `qkv_bias`, `attn_out_bias`, `mlp_bias`, or `lm_head_bias` differs from `bias`, or when `gelu_tanh` is set, `rope_dims` is not 0, `sliding_window` is not 0, `rope_scaling` is not 0, `post_norm` is set, `embed_norm` is set, `final_norm` is false, or `mlm_head` is set. The extended block is true when any of these hold:
 
 - `head_dim > 0` and either `d_model` is not divisible by `num_heads` or `head_dim` is not `d_model / num_heads`
 - `num_kv_heads > 0` and `num_kv_heads != num_heads`
@@ -1107,26 +1119,29 @@ A transformer file, whether saved from the trunk or from the façade, picks a ve
 
 Bert is true when `causal` is false or `type_vocab_size != 0`.
 
-| Config | `Sgd*` overload, null optimizer | `Sgd*` overload, optimizer stored | `AdamW*` overload |
-|---|---|---|---|
-| Classic | 1 | see below | 2 |
-| Extended, not bert | 3 | see below | 4 |
-| Bert | 5 | see below | 6 |
+| Config | `Sgd*` overload, null optimizer | `Sgd*` overload, optimizer stored | `AdamW*` overload, null | `AdamW*` overload, optimizer stored |
+|---|---|---|---|---|
+| Classic | 1 | see below | 2 | 2 |
+| Extended, not bert | 3 | see below | 4 | 4 |
+| Bert | 5 | see below | 6 | 6 |
+| Projection bias | 7 | see below | 7 | 8 |
 
-The `AdamW*` overload always uses the right-hand column, including when the pointer is null. A null `AdamW*` stores `optimizer_present` 0 and no optimizer bytes.
+On a classic, extended, or bert config, the `AdamW*` overload uses the even version, including when the pointer is null. A null `AdamW*` stores `optimizer_present` 0 and no optimizer bytes. On a projection-bias config, a null `AdamW*` writes version 7. An optimizer block on that config writes version 8.
 
 The stored-SGD column depends on which object saves:
 
-- `Network::save` and `ConvResNet::save` call the version helper with the kind word off. A stored SGD file stays version 1, 3, or 5, and the optimizer bytes are the SGD body with no kind tag.
-- `Transformer::save(const Sgd*)` calls the version helper with the kind word on when the pointer is non-null. A stored SGD file is version 2, 4, or 6, and the optimizer bytes start with kind `1` followed by the SGD body.
+- `Network::save` and `ConvResNet::save` call the version helper with the kind word off. A stored SGD file stays version 1, 3, 5, or 7, and the optimizer bytes are the SGD body with no kind tag.
+- `Transformer::save(const Sgd*)` calls the version helper with the kind word on when the pointer is non-null. A stored SGD file is version 2, 4, 6, or 8, and the optimizer bytes start with kind `1` followed by the SGD body.
 
-Versions 1, 3, and 5 store an SGD body with no kind tag when an optimizer is present. Versions 2, 4, and 6 store a `uint32` kind when an optimizer is present: `1` for SGD, `2` for AdamW. Any other kind throws `unsupported optimizer kind N`.
+Versions 1, 3, 5, and 7 store an SGD body with no kind tag when an optimizer is present. Versions 2, 4, 6, and 8 store a `uint32` kind when an optimizer is present: `1` for SGD, `2` for AdamW. Any other kind throws `unsupported optimizer kind N`.
 
 Versions 1 and 2 do not store the extended fields. The loader uses `head_dim = 0`, `num_kv_heads = 0`, `qk_norm = false`, `rope_theta = 10000`, `rms_eps = 1e-5`, `causal = true`, and `type_vocab_size = 0`.
 
 Versions 3 and 4 store the extended fields and leave `causal` true and `type_vocab_size` 0.
 
 Versions 5 and 6 store the extended fields, then `causal`, then `type_vocab_size`.
+
+Versions 7 and 8 store the extended fields, `causal`, `type_vocab_size`, then `qkv_bias`, `attn_out_bias`, `mlp_bias`, `lm_head_bias`, `gelu_tanh`, `rope_dims`, `sliding_window`, `rope_scaling`, `rope_factor`, `rope_low_freq_factor`, `rope_high_freq_factor`, `rope_original_context`, `post_norm`, `embed_norm`, `embed_norm_eps`, `final_norm`, and `mlm_head`. Versions 1 through 6 set the four projection flags equal to `bias` and leave `split_bias` false. Versions 7 and 8 store the four flags from the file and set `split_bias` true. `split_bias` is not written.
 
 ### Config bodies
 
@@ -1144,9 +1159,11 @@ Each config body ends with padding to 8 bytes. The transformer body is the only 
 
 `Transformer`, every version: `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, `max_seq_len`, `dropout` as `float`, `tie_embeddings` as `uint32`, `bias` as `uint32`, `activation` as `uint32`, `positional` as `uint32`.
 
-Versions 3 through 6 then store: `head_dim`, `num_kv_heads`, `qk_norm` as `uint32`, `rope_theta` as `float`, `rms_eps` as `float`.
+Versions 3 through 8 then store: `head_dim`, `num_kv_heads`, `qk_norm` as `uint32`, `rope_theta` as `float`, `rms_eps` as `float`.
 
-Versions 5 and 6 then store: `causal` as `uint32`, `type_vocab_size`.
+Versions 5 through 8 then store: `causal` as `uint32`, `type_vocab_size`.
+
+Versions 7 and 8 then store the seventeen words listed above. `rope_factor`, `rope_low_freq_factor`, `rope_high_freq_factor`, and `embed_norm_eps` are `float`. `rope_dims`, `sliding_window`, and `rope_original_context` are `int32`. The other words are `uint32`.
 
 The loader runs `validate` on the rebuilt config.
 
@@ -1164,7 +1181,7 @@ A façade file writes a batch-norm count of 0.
 
 ### Optimizer bodies
 
-SGD body, with no kind tag on versions 1, 3, and 5, and after kind `1` on versions 2, 4, and 6: `learning_rate` as `float`, `momentum` as `float`, velocity count as `uint32`, a zero `uint32`, then each velocity as `numel` `uint32`, a zero `uint32`, that many floats, pad to 8. The count equals the parameter count. Each `numel` equals that parameter's element count.
+SGD body, with no kind tag on versions 1, 3, 5, and 7, and after kind `1` on versions 2, 4, 6, and 8: `learning_rate` as `float`, `momentum` as `float`, velocity count as `uint32`, a zero `uint32`, then each velocity as `numel` `uint32`, a zero `uint32`, that many floats, pad to 8. The count equals the parameter count. Each `numel` equals that parameter's element count.
 
 AdamW body, after kind `2`: `lr`, `beta1`, `beta2`, `eps` as `float`, group count as `uint32`, a zero `uint32`, then each group. A group is `weight_decay` as `float`, parameter count as `uint32`, then each parameter's `m` and `v`. A moment is `numel` `uint32`, a zero `uint32`, that many floats, pad to 8. The flattened groups equal `parameters()` in order. A zero group, a count that walks off the parameter list, or a length mismatch throws `optimizer state mismatch`.
 
@@ -1174,7 +1191,7 @@ AdamW body, after kind `2`: `lr`, `beta1`, `beta2`, `eps` as `float`, group coun
 |---|---|
 | Unreadable, shorter than 32 bytes, or cut off mid-record | `truncated checkpoint` |
 | Wrong magic | `bad checkpoint magic` |
-| Version outside 1..6 | `unsupported checkpoint version N` |
+| Version outside 1..8 | `unsupported checkpoint version N` |
 | Kind other than 1 or 2 on a version that has a kind tag | `unsupported optimizer kind N` |
 | Bad train flag, optimizer flag, or reserved word | `bad checkpoint header` |
 | Family outside 1..6 | `bad checkpoint family` |

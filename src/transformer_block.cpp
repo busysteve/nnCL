@@ -62,22 +62,25 @@ TransformerBlock::TransformerBlock(Context& ctx, const TransformerBlockSpec& spe
   } else {
     ln1_ = std::make_unique<LayerNorm>(ctx, spec.d_model);
   }
+  const bool qkv_bias = spec.split_bias ? spec.qkv_bias : spec.bias;
+  const bool out_bias = spec.split_bias ? spec.attn_out_bias : spec.bias;
+  const bool mlp_bias = spec.split_bias ? spec.mlp_bias : spec.bias;
   mha_ = std::make_unique<MultiHeadAttention>(ctx, spec.d_model, spec.num_heads, spec.causal, spec.bias,
                                               spec.use_rope, rng, spec.head_dim, spec.num_kv_heads,
-                                              spec.qk_norm, spec.rope_theta, spec.rms_eps);
+                                              spec.qk_norm, spec.rope_theta, spec.rms_eps, qkv_bias, out_bias);
   drop1_ = std::make_unique<Dropout>(ctx, spec.dropout);
   if (spec.use_rope) {
     ln2_ = std::make_unique<RMSNorm>(ctx, spec.d_model, spec.rms_eps);
   } else {
     ln2_ = std::make_unique<LayerNorm>(ctx, spec.d_model);
   }
-  fc1_ = std::make_unique<Linear>(ctx, spec.d_model, fc1_out, spec.bias, rng);
+  fc1_ = std::make_unique<Linear>(ctx, spec.d_model, fc1_out, mlp_bias, rng);
   if (swiglu) {
     act_ = std::make_unique<SwiGLU>(ctx);
   } else {
     act_ = std::make_unique<GELU>(ctx);
   }
-  fc2_ = std::make_unique<Linear>(ctx, spec.d_ff, spec.d_model, spec.bias, rng);
+  fc2_ = std::make_unique<Linear>(ctx, spec.d_ff, spec.d_model, mlp_bias, rng);
   drop2_ = std::make_unique<Dropout>(ctx, spec.dropout);
 }
 

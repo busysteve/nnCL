@@ -24,6 +24,8 @@ constexpr uint32_t kVersionExt = 3u;
 constexpr uint32_t kVersionExtAdamW = 4u;
 constexpr uint32_t kVersionBert = 5u;
 constexpr uint32_t kVersionBertAdamW = 6u;
+constexpr uint32_t kVersionBias = 7u;
+constexpr uint32_t kVersionBiasAdamW = 8u;
 constexpr uint32_t kKindSgd = 1u;
 constexpr uint32_t kKindAdamW = 2u;
 constexpr uint32_t kFloat32 = 1u;
@@ -215,7 +217,7 @@ std::vector<uint8_t> read_file(const std::filesystem::path& path) {
   return bytes;
 }
 
-Header read_header(ByteReader& reader, uint32_t max_version = kVersionBertAdamW) {
+Header read_header(ByteReader& reader, uint32_t max_version = kVersionBiasAdamW) {
   const uint32_t magic = reader.u32();
   if (magic != kMagic) throw Error("bad checkpoint magic");
   const uint32_t version = reader.u32();
@@ -247,7 +249,19 @@ bool transformer_bert(const TransformerConfig& config) {
   return !config.causal || config.type_vocab_size != 0;
 }
 
+bool transformer_v7(const TransformerConfig& config) {
+  if (config.qkv_bias != config.bias || config.attn_out_bias != config.bias ||
+      config.mlp_bias != config.bias || config.lm_head_bias != config.bias) {
+    return true;
+  }
+  if (config.gelu_tanh || config.rope_dims != 0 || config.sliding_window != 0 || config.rope_scaling != 0) {
+    return true;
+  }
+  return config.post_norm || config.embed_norm || !config.final_norm || config.mlm_head;
+}
+
 uint32_t transformer_file_version(const TransformerConfig& config, bool kind_word) {
+  if (transformer_v7(config)) return kind_word ? kVersionBiasAdamW : kVersionBias;
   if (transformer_bert(config)) return kind_word ? kVersionBertAdamW : kVersionBert;
   if (!transformer_extended(config)) return kind_word ? kVersionAdamW : kVersion;
   return kind_word ? kVersionExtAdamW : kVersionExt;
@@ -367,14 +381,38 @@ read_config(ByteReader& reader, uint32_t family, uint32_t version) {
     config.dropout = reader.f32();
     config.tie_embeddings = reader.u32() != 0;
     config.bias = reader.u32() != 0;
+    config.qkv_bias = config.bias;
+    config.attn_out_bias = config.bias;
+    config.mlp_bias = config.bias;
+    config.lm_head_bias = config.bias;
     config.activation = static_cast<TransformerActivation>(reader.u32());
     config.positional = static_cast<PositionalEncoding>(reader.u32());
-    if (version >= kVersionExt && version < kVersionBert) {
+    if (version >= kVersionBias) {
       config.head_dim = reader.i32();
       config.num_kv_heads = reader.i32();
       config.qk_norm = reader.u32() != 0;
       config.rope_theta = reader.f32();
       config.rms_eps = reader.f32();
+      config.causal = reader.u32() != 0;
+      config.type_vocab_size = reader.i32();
+      config.qkv_bias = reader.u32() != 0;
+      config.attn_out_bias = reader.u32() != 0;
+      config.mlp_bias = reader.u32() != 0;
+      config.lm_head_bias = reader.u32() != 0;
+      config.gelu_tanh = reader.u32() != 0;
+      config.rope_dims = reader.i32();
+      config.sliding_window = reader.i32();
+      config.rope_scaling = reader.u32();
+      config.rope_factor = reader.f32();
+      config.rope_low_freq_factor = reader.f32();
+      config.rope_high_freq_factor = reader.f32();
+      config.rope_original_context = reader.i32();
+      config.post_norm = reader.u32() != 0;
+      config.embed_norm = reader.u32() != 0;
+      config.embed_norm_eps = reader.f32();
+      config.final_norm = reader.u32() != 0;
+      config.mlm_head = reader.u32() != 0;
+      config.split_bias = true;
     } else if (version >= kVersionBert) {
       config.head_dim = reader.i32();
       config.num_kv_heads = reader.i32();
@@ -383,6 +421,12 @@ read_config(ByteReader& reader, uint32_t family, uint32_t version) {
       config.rms_eps = reader.f32();
       config.causal = reader.u32() != 0;
       config.type_vocab_size = reader.i32();
+    } else if (version >= kVersionExt) {
+      config.head_dim = reader.i32();
+      config.num_kv_heads = reader.i32();
+      config.qk_norm = reader.u32() != 0;
+      config.rope_theta = reader.f32();
+      config.rms_eps = reader.f32();
     }
     reader.pad8();
     validate(config);
@@ -499,6 +543,26 @@ void write_extended_config(ByteWriter& writer, const TransformerConfig& config) 
   writer.f32(config.rms_eps);
 }
 
+void write_bias_tail(ByteWriter& writer, const TransformerConfig& config) {
+  writer.u32(config.qkv_bias ? 1u : 0u);
+  writer.u32(config.attn_out_bias ? 1u : 0u);
+  writer.u32(config.mlp_bias ? 1u : 0u);
+  writer.u32(config.lm_head_bias ? 1u : 0u);
+  writer.u32(config.gelu_tanh ? 1u : 0u);
+  writer.i32(config.rope_dims);
+  writer.i32(config.sliding_window);
+  writer.u32(config.rope_scaling);
+  writer.f32(config.rope_factor);
+  writer.f32(config.rope_low_freq_factor);
+  writer.f32(config.rope_high_freq_factor);
+  writer.i32(config.rope_original_context);
+  writer.u32(config.post_norm ? 1u : 0u);
+  writer.u32(config.embed_norm ? 1u : 0u);
+  writer.f32(config.embed_norm_eps);
+  writer.u32(config.final_norm ? 1u : 0u);
+  writer.u32(config.mlm_head ? 1u : 0u);
+}
+
 void write_transformer_config(ByteWriter& writer, const TransformerConfig& config, uint32_t version) {
   writer.i32(config.vocab_size);
   writer.i32(config.d_model);
@@ -511,12 +575,17 @@ void write_transformer_config(ByteWriter& writer, const TransformerConfig& confi
   writer.u32(config.bias ? 1u : 0u);
   writer.u32(static_cast<uint32_t>(config.activation));
   writer.u32(static_cast<uint32_t>(config.positional));
-  if (version >= kVersionExt && version < kVersionBert) {
+  if (version >= kVersionBias) {
     write_extended_config(writer, config);
+    writer.u32(config.causal ? 1u : 0u);
+    writer.i32(config.type_vocab_size);
+    write_bias_tail(writer, config);
   } else if (version >= kVersionBert) {
     write_extended_config(writer, config);
     writer.u32(config.causal ? 1u : 0u);
     writer.i32(config.type_vocab_size);
+  } else if (version >= kVersionExt) {
+    write_extended_config(writer, config);
   }
 }
 
@@ -783,9 +852,12 @@ void Network::save(const std::filesystem::path& path, const AdamW* optimizer) co
   if (optimizer) require_owned_by(*this, flat_params(*optimizer));
   ctx_->synchronize();
   ByteWriter writer;
-  const uint32_t version = std::holds_alternative<TransformerConfig>(config())
-                               ? transformer_file_version(std::get<TransformerConfig>(config()), true)
-                               : kVersionAdamW;
+  uint32_t version = kVersionAdamW;
+  if (std::holds_alternative<TransformerConfig>(config())) {
+    const TransformerConfig& transformer = std::get<TransformerConfig>(config());
+    const bool kind_word = transformer_v7(transformer) ? optimizer != nullptr : true;
+    version = transformer_file_version(transformer, kind_word);
+  }
   write_model(writer, *this, version, optimizer ? optimizer->step_count() : 0, optimizer ? 1u : 0u);
   if (optimizer) write_optimizer_adamw(writer, *optimizer);
   commit_checkpoint(path, writer.bytes());
@@ -801,7 +873,8 @@ Network::Loaded Network::load(Context& ctx, const std::filesystem::path& path, L
   std::optional<ParsedOpt> parsed_sgd;
   std::optional<ParsedAdamW> parsed_adamw;
   if (header.optimizer_present) {
-    if (header.version == kVersion || header.version == kVersionExt || header.version == kVersionBert) {
+    if (header.version == kVersion || header.version == kVersionExt || header.version == kVersionBert ||
+        header.version == kVersionBias) {
       parsed_sgd = read_opt(reader, parsed_params);
     } else {
       const uint32_t kind = reader.u32();
@@ -916,7 +989,7 @@ void Transformer::save(const std::filesystem::path& path, const AdamW* optimizer
 
   ByteWriter writer;
   writer.u32(kMagic);
-  const uint32_t version = transformer_file_version(config, true);
+  const uint32_t version = transformer_file_version(config, transformer_v7(config) ? optimizer != nullptr : true);
   writer.u32(version);
   writer.u32(static_cast<uint32_t>(network().family()));
   writer.u32(training() ? 1u : 0u);
@@ -933,7 +1006,7 @@ void Transformer::save(const std::filesystem::path& path, const AdamW* optimizer
 
 Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path& path, LoadMode mode) {
   ByteReader reader(read_file(path));
-  const Header header = read_header(reader, kVersionBertAdamW);
+  const Header header = read_header(reader, kVersionBiasAdamW);
   if (header.family != static_cast<uint32_t>(Family::Transformer)) throw Error("bad checkpoint family");
   const auto config_var = read_config(reader, header.family, header.version);
   const TransformerConfig& config = std::get<TransformerConfig>(config_var);
@@ -945,7 +1018,7 @@ Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path&
   std::optional<ParsedAdamW> parsed_adamw;
   if (header.optimizer_present) {
     if (header.version == kVersionAdamW || header.version == kVersionExtAdamW ||
-        header.version == kVersionBertAdamW) {
+        header.version == kVersionBertAdamW || header.version == kVersionBiasAdamW) {
       const uint32_t kind = reader.u32();
       if (kind == kKindSgd) parsed_opt = read_opt(reader, parsed_params);
       else if (kind == kKindAdamW) parsed_adamw = read_adamw(reader, parsed_params);

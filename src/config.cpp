@@ -151,6 +151,36 @@ void validate(const TransformerConfig& config) {
   if (!(config.rms_eps > 0.f) || !std::isfinite(config.rms_eps)) bad("rms_eps");
   if (config.activation == TransformerActivation::SwiGLU && config.d_ff > INT_MAX / 2) bad("d_ff");
   if (config.type_vocab_size < 0) bad("type_vocab_size");
+  if (config.rope_dims < 0 ||
+      (config.rope_dims != 0 && (config.rope_dims % 2 != 0 || config.rope_dims > head_dim))) {
+    bad("rope_dims");
+  }
+  if (config.sliding_window < 0) bad("sliding_window");
+  if (config.rope_scaling > 1u) bad("rope_scaling");
+  if (config.rope_scaling == 1u &&
+      (!(config.rope_factor > 0.f) || !std::isfinite(config.rope_factor))) {
+    bad("rope_factor");
+  }
+  if (config.mlm_head && config.causal) bad("mlm_head");
+  // These fields are stored so a later step can turn them on. The kernels do not run them yet.
+  if (config.gelu_tanh) bad("gelu_tanh");
+  if (config.rope_dims != 0) bad("rope_dims");
+  if (config.sliding_window != 0) bad("sliding_window");
+  if (config.rope_scaling != 0) bad("rope_scaling");
+  if (config.post_norm) bad("post_norm");
+  if (config.embed_norm) bad("embed_norm");
+  if (!config.final_norm) bad("final_norm");
+  if (config.mlm_head) bad("mlm_head");
+}
+
+TransformerConfig apply_bias_flags(TransformerConfig config) {
+  if (!config.split_bias) {
+    config.qkv_bias = config.bias;
+    config.attn_out_bias = config.bias;
+    config.mlp_bias = config.bias;
+    config.lm_head_bias = config.bias;
+  }
+  return config;
 }
 
 }  // namespace nn

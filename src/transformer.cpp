@@ -76,6 +76,7 @@ const Tensor& add_embeddings(Context& ctx, const Tensor& tok, const Tensor* pos,
 
 Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t seed) : ctx_(&ctx) {
   validate(config);
+  const TransformerConfig built = apply_bias_flags(config);
   std::mt19937 rng(seed);
   tok_emb_ = std::make_unique<Embedding>(ctx, config.vocab_size, config.d_model, rng);
   tok_emb_->set_name("tok_emb");
@@ -88,20 +89,8 @@ Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t
     type_emb_->set_name("type_emb");
   }
   TransformerBlockSpec block_spec;
-  block_spec.d_model = config.d_model;
-  block_spec.num_heads = config.num_heads;
-  block_spec.d_ff = config.d_ff;
-  block_spec.dropout = config.dropout;
-  block_spec.bias = config.bias;
-  block_spec.activation = config.activation;
-  const bool rope = config.positional == PositionalEncoding::Rope;
-  block_spec.use_rope = rope;
-  block_spec.head_dim = config.head_dim;
-  block_spec.num_kv_heads = config.num_kv_heads;
-  block_spec.qk_norm = config.qk_norm;
-  block_spec.rope_theta = config.rope_theta;
-  block_spec.rms_eps = config.rms_eps;
-  block_spec.causal = config.causal;
+  fill_transformer_block_spec(block_spec, built);
+  const bool rope = built.positional == PositionalEncoding::Rope;
 
   std::vector<std::unique_ptr<Layer>> layers;
   for (int i = 0; i < config.num_layers; ++i) {
@@ -119,11 +108,11 @@ Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t
   final_ln->set_name("final_ln");
   final_ln_ptr_ = final_ln.get();
   layers.push_back(std::move(final_ln));
-  auto lm_head = std::make_unique<Linear>(ctx, config.d_model, config.vocab_size, config.bias, rng);
+  auto lm_head = std::make_unique<Linear>(ctx, config.d_model, config.vocab_size, built.lm_head_bias, rng);
   lm_head->set_name("lm_head");
   lm_head_ptr_ = lm_head.get();
   layers.push_back(std::move(lm_head));
-  network_ = Network(ctx, Family::Transformer, std::move(layers), config);
+  network_ = Network(ctx, Family::Transformer, std::move(layers), built);
 }
 
 const Tensor& Transformer::forward(const IndexTensor& tokens) { return forward_tokens(tokens, nullptr); }

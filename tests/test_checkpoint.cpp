@@ -996,6 +996,190 @@ int test_checkpoint() {
     CHECK(decode_threw);
   }
 
+  {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 2;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = false;
+    config.split_bias = true;
+    config.qkv_bias = true;
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.positional = nn::PositionalEncoding::Rope;
+    nn::Transformer model(ctx, config, 9);
+    bool saw_q = false;
+    bool saw_k = false;
+    bool saw_v = false;
+    for (const nn::NamedParam& param : model.parameters()) {
+      if (param.name == "blocks.0.attn.q.bias") {
+        saw_q = true;
+        CHECK(param.value->shape() == std::vector<int>{8});
+      }
+      if (param.name == "blocks.0.attn.k.bias") {
+        saw_k = true;
+        CHECK(param.value->shape() == std::vector<int>{8});
+      }
+      if (param.name == "blocks.0.attn.v.bias") {
+        saw_v = true;
+        CHECK(param.value->shape() == std::vector<int>{8});
+      }
+      CHECK(param.name != "blocks.0.attn.out.bias");
+      CHECK(param.name != "blocks.0.fc1.bias");
+      CHECK(param.name != "blocks.0.fc2.bias");
+      CHECK(param.name != "lm_head.bias");
+    }
+    CHECK(saw_q);
+    CHECK(saw_k);
+    CHECK(saw_v);
+    const nn::TransformerConfig& stored = std::get<nn::TransformerConfig>(model.network().config());
+    CHECK(stored.split_bias);
+    CHECK(stored.qkv_bias);
+    CHECK(!stored.attn_out_bias);
+    CHECK(!stored.mlp_bias);
+    CHECK(!stored.lm_head_bias);
+    CHECK(!stored.bias);
+
+    const std::filesystem::path path = dir / "facade-qkv-bias.bin";
+    model.save(path, nullptr);
+    CHECK(read_u32(read_bytes(path), 4) == 7);
+    nn::IndexTensor tokens(ctx, {1, 3});
+    const std::vector<int64_t> ids = {1, 0, 2};
+    tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+    const std::vector<float> logits = model.forward(tokens).to_host();
+    const std::vector<nn::NamedParam> params = model.parameters();
+    nn::Transformer::Loaded loaded = nn::Transformer::load(ctx, path, nn::LoadMode::Inference);
+    const nn::TransformerConfig& restored = std::get<nn::TransformerConfig>(loaded.model.network().config());
+    CHECK(restored.split_bias);
+    CHECK(restored.qkv_bias);
+    CHECK(!restored.attn_out_bias);
+    CHECK(!restored.mlp_bias);
+    CHECK(!restored.lm_head_bias);
+    CHECK(!restored.bias);
+    CHECK(loaded.model.parameters().size() == params.size());
+    for (size_t i = 0; i < params.size(); ++i) {
+      CHECK(loaded.model.parameters()[i].name == params[i].name);
+      CHECK(loaded.model.parameters()[i].value->shape() == params[i].value->shape());
+      expect_bits(loaded.model.parameters()[i].value->to_host(), params[i].value->to_host(), params[i].name.c_str());
+    }
+    expect_bits(loaded.model.forward(tokens).to_host(), logits, "qkv bias logits");
+    nn::Network trunk = nn::build_transformer_network(ctx, config, 9);
+    const std::filesystem::path trunk_path = dir / "trunk-qkv-bias.bin";
+    trunk.save(trunk_path, nullptr);
+    CHECK(read_u32(read_bytes(trunk_path), 4) == 7);
+    nn::Network::Loaded network = nn::Network::load(ctx, trunk_path, nn::LoadMode::Inference);
+    const nn::TransformerConfig& trunk_cfg = std::get<nn::TransformerConfig>(network.network.config());
+    CHECK(trunk_cfg.split_bias);
+    CHECK(trunk_cfg.qkv_bias);
+    CHECK(!trunk_cfg.attn_out_bias);
+    CHECK(!trunk_cfg.mlp_bias);
+    CHECK(!trunk_cfg.lm_head_bias);
+    const std::vector<nn::NamedParam> trunk_params = trunk.parameters();
+    CHECK(network.network.parameters().size() == trunk_params.size());
+    bool trunk_q = false;
+    for (size_t i = 0; i < trunk_params.size(); ++i) {
+      CHECK(network.network.parameters()[i].name == trunk_params[i].name);
+      if (trunk_params[i].name == "blocks.0.attn.q.bias") trunk_q = true;
+      CHECK(trunk_params[i].name != "blocks.0.attn.out.bias");
+      CHECK(trunk_params[i].name != "blocks.0.fc1.bias");
+      CHECK(trunk_params[i].name != "lm_head.bias");
+    }
+    CHECK(trunk_q);
+
+    model.save(dir / "facade-qkv-bias-null-adamw.bin", static_cast<const nn::AdamW*>(nullptr));
+    CHECK(read_u32(read_bytes(dir / "facade-qkv-bias-null-adamw.bin"), 4) == 7);
+    nn::AdamW optimizer = make_facade_adamw(model);
+    step_facade_adamw(model, optimizer, ctx);
+    const std::filesystem::path adamw_path = dir / "facade-qkv-bias-adamw.bin";
+    model.save(adamw_path, &optimizer);
+    CHECK(read_u32(read_bytes(adamw_path), 4) == 8);
+    nn::Transformer::Loaded resumed = nn::Transformer::load(ctx, adamw_path, nn::LoadMode::Resume);
+    CHECK(resumed.adamw.has_value());
+    CHECK(resumed.step == 1);
+    compare_facade_adamw(model, resumed.model, optimizer, *resumed.adamw);
+
+    nn::TransformerConfig uniform = config;
+    uniform.split_bias = false;
+    uniform.qkv_bias = true;
+    nn::Transformer plain(ctx, uniform, 3);
+    plain.save(dir / "facade-qkv-ignored.bin", nullptr);
+    CHECK(read_u32(read_bytes(dir / "facade-qkv-ignored.bin"), 4) == 1);
+    for (const nn::NamedParam& param : plain.parameters()) {
+      CHECK(param.name.size() < 5 || param.name.compare(param.name.size() - 5, 5, ".bias") != 0);
+    }
+
+    nn::TransformerConfig zeros = config;
+    zeros.bias = true;
+    zeros.split_bias = true;
+    zeros.qkv_bias = false;
+    nn::Transformer cleared(ctx, zeros, 4);
+    cleared.save(dir / "facade-bias-cleared.bin", nullptr);
+    CHECK(read_u32(read_bytes(dir / "facade-bias-cleared.bin"), 4) == 7);
+    nn::Transformer::Loaded cleared_loaded =
+        nn::Transformer::load(ctx, dir / "facade-bias-cleared.bin", nn::LoadMode::Inference);
+    const nn::TransformerConfig& cleared_cfg =
+        std::get<nn::TransformerConfig>(cleared_loaded.model.network().config());
+    CHECK(cleared_cfg.bias);
+    CHECK(cleared_cfg.split_bias);
+    CHECK(!cleared_cfg.qkv_bias);
+    CHECK(!cleared_cfg.attn_out_bias);
+    CHECK(!cleared_cfg.mlp_bias);
+    CHECK(!cleared_cfg.lm_head_bias);
+    for (const nn::NamedParam& param : cleared_loaded.model.parameters()) {
+      CHECK(param.name.size() < 5 || param.name.compare(param.name.size() - 5, 5, ".bias") != 0);
+    }
+    cleared_loaded.model.save(dir / "facade-bias-cleared-again.bin", nullptr);
+    CHECK(read_u32(read_bytes(dir / "facade-bias-cleared-again.bin"), 4) == 7);
+
+    auto expect_invalid = [&](nn::TransformerConfig bad, const char* field) {
+      bool threw = false;
+      try {
+        nn::Transformer rejected(ctx, bad, 1);
+        (void)rejected;
+      } catch (const std::invalid_argument& error) {
+        threw = std::string(error.what()) == field;
+      }
+      CHECK(threw);
+    };
+    nn::TransformerConfig bad = config;
+    bad.split_bias = false;
+    bad.gelu_tanh = true;
+    expect_invalid(bad, "gelu_tanh");
+    bad.gelu_tanh = false;
+    bad.rope_dims = 3;
+    expect_invalid(bad, "rope_dims");
+    bad.rope_dims = 2;
+    expect_invalid(bad, "rope_dims");
+    bad.rope_dims = 0;
+    bad.sliding_window = -1;
+    expect_invalid(bad, "sliding_window");
+    bad.sliding_window = 2;
+    expect_invalid(bad, "sliding_window");
+    bad.sliding_window = 0;
+    bad.rope_scaling = 1;
+    bad.rope_factor = 0.f;
+    expect_invalid(bad, "rope_factor");
+    bad.rope_factor = 8.f;
+    expect_invalid(bad, "rope_scaling");
+    bad.rope_scaling = 0;
+    bad.post_norm = true;
+    expect_invalid(bad, "post_norm");
+    bad.post_norm = false;
+    bad.embed_norm = true;
+    expect_invalid(bad, "embed_norm");
+    bad.embed_norm = false;
+    bad.final_norm = false;
+    expect_invalid(bad, "final_norm");
+    bad.final_norm = true;
+    bad.mlm_head = true;
+    expect_invalid(bad, "mlm_head");
+    bad.causal = false;
+    expect_invalid(bad, "mlm_head");
+  }
+
   std::printf("ckpt ok\n");
   return 0;
 }

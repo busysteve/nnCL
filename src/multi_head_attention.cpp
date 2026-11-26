@@ -88,7 +88,8 @@ void gemm_dk_bf16(Context& ctx, const uint16_t* q, const uint16_t* ds, uint16_t*
 
 MultiHeadAttention::MultiHeadAttention(Context& ctx, int d_model, int num_heads, bool causal,
                                        bool use_bias, bool use_rope, std::mt19937& rng, int head_dim,
-                                       int num_kv_heads, bool qk_norm, float rope_theta, float rms_eps)
+                                       int num_kv_heads, bool qk_norm, float rope_theta, float rms_eps,
+                                       std::optional<bool> qkv_bias, std::optional<bool> attn_out_bias)
     : ctx_(attention_context(ctx, d_model, num_heads, head_dim, num_kv_heads, use_rope, rope_theta,
                              rms_eps)),
       d_model_(d_model),
@@ -103,17 +104,17 @@ MultiHeadAttention::MultiHeadAttention(Context& ctx, int d_model, int num_heads,
       qk_norm_(qk_norm),
       rope_theta_(rope_theta),
       q_(std::make_unique<Linear>(*ctx_, d_model, num_heads * (head_dim == 0 ? d_model / num_heads : head_dim),
-                                  use_bias, rng)),
+                                  qkv_bias.value_or(use_bias), rng)),
       k_(std::make_unique<Linear>(
           *ctx_, d_model,
           (num_kv_heads == 0 ? num_heads : num_kv_heads) * (head_dim == 0 ? d_model / num_heads : head_dim),
-          use_bias, rng)),
+          qkv_bias.value_or(use_bias), rng)),
       v_(std::make_unique<Linear>(
           *ctx_, d_model,
           (num_kv_heads == 0 ? num_heads : num_kv_heads) * (head_dim == 0 ? d_model / num_heads : head_dim),
-          use_bias, rng)),
+          qkv_bias.value_or(use_bias), rng)),
       out_(std::make_unique<Linear>(*ctx_, num_heads * (head_dim == 0 ? d_model / num_heads : head_dim), d_model,
-                                    use_bias, rng)) {
+                                    attn_out_bias.value_or(use_bias), rng)) {
   if (qk_norm) {
     q_norm_ = std::make_unique<RMSNorm>(*ctx_, head_dim_, rms_eps);
     k_norm_ = std::make_unique<RMSNorm>(*ctx_, head_dim_, rms_eps);

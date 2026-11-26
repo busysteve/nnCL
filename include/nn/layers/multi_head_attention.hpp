@@ -19,9 +19,12 @@ class MultiHeadAttention : public Layer {
   };
 
   // head_dim 0 and num_kv_heads 0 keep Q, K, and V square at d_model.
+  // qkv_bias and attn_out_bias follow use_bias when left unset.
   MultiHeadAttention(Context& ctx, int d_model, int num_heads, bool causal, bool use_bias,
                      bool use_rope, std::mt19937& rng, int head_dim = 0, int num_kv_heads = 0,
-                     bool qk_norm = false, float rope_theta = 10000.f, float rms_eps = 1e-5f);
+                     bool qk_norm = false, float rope_theta = 10000.f, float rms_eps = 1e-5f,
+                     std::optional<bool> qkv_bias = std::nullopt,
+                     std::optional<bool> attn_out_bias = std::nullopt);
   const Tensor& forward(const Tensor& input) override;  // (N,T,D)
   const Tensor& forward_cached(const Tensor& x_t, Cache& cache);
   void reset_cache(Cache& cache, int batch, int t_max) const;
