@@ -2,7 +2,7 @@
 
 This tree is the OpenCL implementation of namespace `nn`. Public headers live under `include/nn/` and do not include OpenCL headers. The static library target is `nn`. The call contract is [api.md](api.md).
 
-`src/checkpoint.cpp`, `include/nn/transformer.hpp`, and `include/nn/layer.hpp` are the same bytes in `nnCUDA`, `nnCL`, `nnROCm`, and `nnArc`. `include/nn/context.hpp` differs in comments. This tree's `Context` indexes the vendor list from `NNCL_OPENCL` and does not call `cudaSetDevice`.
+`src/checkpoint.cpp`, `include/nn/transformer.hpp`, and `include/nn/layer.hpp` are the same bytes in `nnCUDA`, `nnCL`, `nnROCm`, and `nnArc`. `include/nn/context.hpp` differs in comments and in how a device is opened. `nnArc` has no `include/nn/dtype.hpp` and no `Context::set_activation_dtype`. This tree's `Context` indexes the vendor list from `NNCL_OPENCL` and does not call `cudaSetDevice`.
 
 ## Where a call lands
 

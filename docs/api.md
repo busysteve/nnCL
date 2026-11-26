@@ -1,23 +1,25 @@
 # API specification
 
-This is the contract of the C++ API in namespace `nn`. Two libraries implement it.
+This is the contract of the C++ API in namespace `nn`. Four libraries implement it.
 
 | Library | Tree | Backend |
 |---|---|---|
 | `nn` | [busysteve/nnCUDA](https://github.com/busysteve/nnCUDA) | CUDA, cuBLAS, cuDNN |
 | `nnCL` | [busysteve/nnCL](https://github.com/busysteve/nnCL) | OpenCL |
+| `nnROCm` | [busysteve/nnROCm](https://github.com/busysteve/nnROCm) | HIP, hipBLAS, rocBLAS |
+| `nnArc` | [busysteve/nnArc](https://github.com/busysteve/nnArc) | SYCL, oneMKL |
 
-The public headers under `include/nn/` are the same in both trees. The only header that differs is `nn/context.hpp`, and the difference is comments. A checkpoint written by one library loads in the other. `src/checkpoint.cpp` is the same file in both trees.
+`nnCUDA`, `nnCL`, and `nnROCm` share the public headers. Among those three, the only header that differs is `nn/context.hpp`, and the difference is comments. `nnArc` has no `include/nn/dtype.hpp` and no `Context::set_activation_dtype`. Its activations stay float32. `src/checkpoint.cpp` is the same file in all four trees, so a checkpoint written by one loads in the others.
 
-`nn/USAGE.md` is a programmer's guide for the CUDA tree. This document is the contract. It includes the Qwen-style attention fields and checkpoint versions 1 through 8.
+`USAGE.md` in `nnCUDA`, `nnROCm`, and `nnArc` is the programmer's guide for that tree. `nnCL` documents the build in `README.md` and the call contract in this file. This document includes the Qwen-style attention fields and checkpoint versions 1 through 8.
 
-The CMake target is `nn` in both trees. Headers do not include CUDA, OpenCL, cuBLAS, or cuDNN headers. A program that links `libnn.a` by hand also links the backend libraries that archive was built against: `CUDA::cudart`, `CUDA::cublas`, and cuDNN for `nn`; the OpenCL loader for `nnCL`.
+The CMake target is `nn` in every tree. Headers do not include CUDA, HIP, OpenCL, SYCL, cuBLAS, hipBLAS, cuDNN, or oneMKL headers. A program that links `libnn.a` by hand also links the backend libraries that archive was built against: `CUDA::cudart`, `CUDA::cublas`, and cuDNN for `nn`; the OpenCL loader for `nnCL`; `roc::hipblas` and `roc::rocblas` for `nnROCm`; `MKL::MKL_SYCL::BLAS` and the SYCL runtime (`-fsycl`) for `nnArc`.
 
 ## 1. Program model
 
 The language is C++17. Everything public is in namespace `nn`.
 
-Create one `Context`. Pass that same `Context&` to every tensor, index buffer, layer, loss, and optimizer that must share work. Each context owns one in-order queue: a non-default CUDA stream, or one OpenCL command queue. Destroy tensors, layers, networks, and optimizers before the context.
+Create one `Context`. Pass that same `Context&` to every tensor, index buffer, layer, loss, and optimizer that must share work. Each context owns one in-order queue: a non-default CUDA stream, a non-default HIP stream, one OpenCL command queue, or one in-order SYCL queue. Destroy tensors, layers, networks, and optimizers before the context.
 
 `forward` and `backward` return `const Tensor&` into storage owned by that layer. The reference stays valid until the next `forward` or `backward` on the same layer, or until the layer is destroyed. Keep values with `to_host` or `copy_from`.
 
@@ -25,7 +27,7 @@ Create one `Context`. Pass that same `Context&` to every tensor, index buffer, l
 
 Weight and bias gradients accumulate. Call `zero_grad` once per step. `zero_grad` does not change parameter values, optimizer state, or batch-norm buffers. A new network is in train mode. Call `eval()` before inference when the network contains batch-norm or dropout.
 
-Parameters, the gradients Adam sees, optimizer state, and checkpoints are dense float32. Retained activations (layer outputs and caches, attention scores, and the KV cache) are bfloat16 unless `set_activation_dtype(Float32)` selects float32. A matmul reads bfloat16 operands and accumulates float32. Softmax, layer-norm, and RMSNorm compute in float32. `to_host()` widens bfloat16 to float. `data()` on a bfloat16 tensor throws `tensor dtype`. Index buffers are dense `int64`. Layout:
+Parameters, the gradients Adam sees, optimizer state, and checkpoints are dense float32. On `nnCUDA`, `nnCL`, and `nnROCm`, retained activations (layer outputs and caches, attention scores, and the KV cache) are bfloat16 unless `set_activation_dtype(Float32)` selects float32. A matmul reads bfloat16 operands and accumulates float32. Softmax, layer-norm, and RMSNorm compute in float32. `to_host()` widens bfloat16 to float. `data()` on a bfloat16 tensor throws `tensor dtype`. `nnArc` has no `dtype.hpp`. Its activations stay float32 and `data()` returns `float*`. Index buffers are dense `int64`. Layout:
 
 | Rank | Shape | Order |
 |---|---|---|
@@ -40,7 +42,7 @@ A tensor element count must fit in a signed 32-bit integer. Every dimension is a
 
 Two exception types are part of the contract. The message text is part of the contract. Callers match it.
 
-`nn::Error` extends `std::runtime_error`. It reports a failed backend call, a bad tensor or layer argument, a device failure, or a checkpoint problem. A backend status is `call: STATUS_NAME`. CUDA examples look like `cudnnConvolutionForward: CUDNN_STATUS_BAD_PARAM` or `cudaMemcpyAsync: <cuda error name>`. OpenCL examples look like `clFinish: CL_STATUS_NAME`.
+`nn::Error` extends `std::runtime_error`. It reports a failed backend call, a bad tensor or layer argument, a device failure, or a checkpoint problem. A backend status is `call: STATUS_NAME`. CUDA examples look like `cudnnConvolutionForward: CUDNN_STATUS_BAD_PARAM` or `cudaMemcpyAsync: <cuda error name>`. ROCm examples look like `hipblasGemmEx: HIPBLAS_STATUS_NOT_SUPPORTED` or `hipMalloc: hipErrorOutOfMemory`. OpenCL examples look like `clFinish: CL_STATUS_NAME`. Arc examples look like `gemm: <what>`, `gemm_batch: <what>`, `sycl::malloc_device: null`, `sycl::memcpy: <what>`, or `sycl::queue: <what>`.
 
 `std::invalid_argument` reports a rejected config field or one of the call-site checks named in the sections below. `validate` throws `std::invalid_argument` and the message is the field name.
 
@@ -80,16 +82,21 @@ class Context {
 
 `to_host`, `kaiming_normal`, and `normal_` synchronize for you. `copy_from_host` queues the upload. Call `synchronize()` before reusing or freeing the host buffer.
 
-| | `nn` (CUDA) | `nnCL` (OpenCL) |
-|---|---|---|
-| `Context()` | Uses the current CUDA device. Does not call `cudaSetDevice`. | Opens index 0 of the filtered list below. |
-| `Context(int)` | Calls `cudaSetDevice`, then opens that device. | Opens that index. Does not reorder the process-wide device. |
-| `Context(string)` | `select_device`, then `cudaSetDevice`. | `select_device`, then open that index. |
-| Visible devices | Every visible CUDA device. | Devices accepted by the build filter below. |
-| Queue | One non-default CUDA stream, plus a cuDNN handle and a cuBLAS handle bound to it. | One in-order OpenCL command queue. |
-| `data()` | A CUDA device pointer. A CUDA caller may `cudaMemcpy` it on this stream. | Not a host pointer. Read it with `to_host()`. |
+| | `nn` (CUDA) | `nnCL` (OpenCL) | `nnROCm` (ROCm) | `nnArc` (Arc) |
+|---|---|---|---|---|
+| `Context()` | Uses the current CUDA device. Does not call `cudaSetDevice`. | Opens index 0 of the filtered list below. | Uses the current HIP device. Does not call `hipSetDevice`. | Opens index 0 of the Intel GPU list below. |
+| `Context(int)` | Calls `cudaSetDevice`, then opens that device. | Opens that index. Does not reorder the process-wide device. | Calls `hipSetDevice`, then opens that device. | Opens that index. Does not reorder a process-wide device. |
+| `Context(string)` | `select_device`, then `cudaSetDevice`. | `select_device`, then open that index. | `select_device`, then `hipSetDevice`. | `select_device`, then open that index. |
+| Visible devices | Every visible CUDA device. | Devices accepted by the build filter below. | Every visible HIP device. | Intel GPUs. Opening one that cannot run a 256-thread work-group throws `device`. |
+| Queue | One non-default CUDA stream, plus a cuDNN handle and a cuBLAS handle bound to it. | One in-order OpenCL command queue. | One non-default HIP stream, plus a hipBLAS handle bound to it. | One in-order SYCL queue. |
+| `data()` | A CUDA device pointer. A CUDA caller may `cudaMemcpy` it on this stream. | Not a host pointer. Read it with `to_host()`. | A HIP device pointer. A HIP caller may `hipMemcpy` it on this stream. | A device USM pointer. Read it with `to_host()`. |
+| Activations | bfloat16 by default | bfloat16 by default | bfloat16 by default | float32. No `dtype.hpp`. |
 
 `nnCL` device filter. The CMake cache variable `NNCL_OPENCL` is `auto`, `radeon`, `intel`, `apple`, or `nvidia`. It is fixed at compile time. `auto` keeps GPUs and does not keep a CPU device. `radeon`, `apple`, and `nvidia` keep that vendor's GPUs. `intel` keeps an Intel GPU, or the Intel CPU device when no Intel GPU is listed. A device is kept only when its max work-group size is at least 256. A requested vendor that is not installed fails at context creation with `device`. The kernel source is `src/kernels.cl`, compiled at runtime with `-cl-std=CL1.2` or `-cl-std=CL2.0` from the device's OpenCL C version. A device that reports 2.0 or 3.0 is built as OpenCL C 2.0. A 1.2 device is built as OpenCL C 1.2. An Apple host includes `<OpenCL/cl.h>` and creates the queue with `clCreateCommandQueue`. Other hosts use the OpenCL 3.0 headers and `clCreateCommandQueueWithProperties`.
+
+`nnROCm` devices. `device_count()` is `hipGetDeviceCount`. There is no vendor filter. The default CMake architecture is `gfx1152` (`CMAKE_HIP_ARCHITECTURES`). `Context()` does not call `hipSetDevice`. `Context(int)` and `Context(string)` do. The queue is one non-default HIP stream. The hipBLAS handle is bound to that stream, uses host pointer mode, and disallows atomics so a repeated GEMM matches. `rocblas_initialize()` runs when the context opens. `data()` is a HIP device pointer. Retained activations are bfloat16 unless `set_activation_dtype(Float32)` selects float32.
+
+`nnArc` devices. The list is Intel GPUs whose vendor string contains `intel`, compared case-insensitively. A discrete Arc and an integrated Iris Xe both qualify. Opening a device throws `device` when its maximum work-group size is below 256 or no subgroup size in 8..32 divides 256. An empty list throws `device`. There is no process-wide current device. `Context()` opens index 0. `Context(int)` and `Context(string)` open that index and do not reorder other devices. The queue is one in-order SYCL queue (`sycl::property::queue::in_order`). Device memory is USM from `sycl::malloc_device`. `data()` is a device USM pointer. Read it with `to_host()`. Kernels are JIT-compiled to SPIR-V (`spir64`). There is no ahead-of-time architecture, so one binary covers Arc SKUs and Iris Xe. GEMM is oneMKL SYCL BLAS in float32. A stride of 0 is a loop of single GEMMs, because strided `gemm_batch` does not promise a zero stride. There is no TF32 mode. `nnArc` has no `dtype.hpp` and no `set_activation_dtype`. Activations stay float32.
 
 `select_device("auto")` is the first device in the list above. It is not the `NNCL_OPENCL` vendor filter.
 
